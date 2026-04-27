@@ -56,7 +56,7 @@ def log(message, to_file=True):
         except Exception as e:
             print(f"[LOG ERROR] {e}")
 
-# ====================== FLASK LIVE VIEWER (with stats header) ======================
+# ====================== FLASK LIVE VIEWER ======================
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
@@ -65,7 +65,6 @@ def show_log():
     try:
         display_content = "\n".join(recent_logs)
         
-        # Calculate live stats
         win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
         pnl_color = "#4ade80" if daily_pnl >= 0 else "#f87171"
         pnl_sign = "+" if daily_pnl >= 0 else ""
@@ -77,16 +76,9 @@ def show_log():
             <style>
                 body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.4; margin: 0; }}
                 .stats-header {{
-                    background: #252526;
-                    border: 2px solid #3c3c3c;
-                    border-radius: 8px;
-                    padding: 15px 20px;
-                    margin-bottom: 20px;
-                    font-size: 18px;
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 25px;
-                    align-items: center;
+                    background: #252526; border: 2px solid #3c3c3c; border-radius: 8px;
+                    padding: 15px 20px; margin-bottom: 20px; font-size: 18px;
+                    display: flex; flex-wrap: wrap; gap: 25px; align-items: center;
                 }}
                 .stat-item {{ display: flex; align-items: center; gap: 8px; }}
                 .stat-label {{ color: #888; font-size: 14px; }}
@@ -104,26 +96,11 @@ def show_log():
             <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log</h2>
             
             <div class="stats-header">
-                <div class="stat-item">
-                    <span class="stat-label">WINS</span>
-                    <strong style="color:#4ade80">{wins}</strong>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">LOSSES</span>
-                    <strong style="color:#f87171">{losses}</strong>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">WIN RATE</span>
-                    <strong>{win_rate:.1f}%</strong>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">TRADES TODAY</span>
-                    <strong>{daily_trades}</strong>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">PNL TODAY</span>
-                    <strong class="pnl" style="color:{pnl_color}">{pnl_sign}${daily_pnl:.2f}</strong>
-                </div>
+                <div class="stat-item"><span class="stat-label">WINS</span><strong style="color:#4ade80">{wins}</strong></div>
+                <div class="stat-item"><span class="stat-label">LOSSES</span><strong style="color:#f87171">{losses}</strong></div>
+                <div class="stat-item"><span class="stat-label">WIN RATE</span><strong>{win_rate:.1f}%</strong></div>
+                <div class="stat-item"><span class="stat-label">TRADES TODAY</span><strong>{daily_trades}</strong></div>
+                <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${daily_pnl:.2f}</strong></div>
             </div>
 
             <pre id="logpre">{display_content}</pre>
@@ -166,7 +143,7 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ====================== BOT LOGIC (unchanged except breakeven fix) ======================
+# ====================== BOT LOGIC ======================
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
 last_trade_time = None
@@ -230,7 +207,6 @@ async def fetch_latest_candles(symbol, tf, limit=500):
         return pd.DataFrame()
 
 async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd, score, choch_level):
-    # (same as previous working version)
     log(f"=== ATTEMPTING ORDER === [{symbol}] {side.upper()} | Score: {score:.1f} | CHOCH Level: {choch_level:.4f}", to_file=True)
     try:
         m = exchange.market(symbol)
@@ -256,6 +232,22 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
 
         log(f"✅ ORDER CREATED | ID: {order.get('id')}", to_file=True)
 
+        # === DETAILED POSITION SUMMARY (this is what you asked for) ===
+        rr = RR_RATIO
+        log(f"""
+=== POSITION OPENED SUCCESSFULLY ===
+Symbol     : {symbol}
+Side       : {side.upper()}
+Entry      : {current_price:.4f}
+Stop Loss  : {stop_price:.4f}
+Take Profit: {tp_price:.4f} ({rr:.1f}R)
+Quantity   : {quantity:.4f}
+Risk USD   : ${risk_usd:.2f}
+Leverage   : {LEVERAGE}x
+Score      : {score:.1f}
+CHOCH Level: {choch_level:.4f}
+""".strip(), to_file=True)
+
         await asyncio.sleep(2)
         positions = exchange.fetch_positions()
         symbol_pos = next((p for p in positions if p['symbol'] == symbol and float(p.get('contracts', 0)) != 0), None)
@@ -277,13 +269,13 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         log(f"❌ ORDER FAILED: {e}", to_file=True)
         return None
 
+# (manage_open_trade, main(), etc. remain exactly as in the previous working version with breakeven fix)
 async def manage_open_trade(symbol, df):
     if symbol not in active_trades:
         return
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
 
-    # FIXED Breakeven Logic
     if not trade.get('breakeven_moved', False) and trade.get('choch_level'):
         choch_level = trade['choch_level']
         if (trade['side'] == 'buy' and current_price > choch_level) or \
@@ -296,18 +288,13 @@ async def manage_open_trade(symbol, df):
                     type='stopMarket',
                     side=side_for_sl,
                     amount=trade['quantity'],
-                    params={
-                        'stopPrice': new_sl,
-                        'reduceOnly': True,
-                        'trigger': 'mark'
-                    }
+                    params={'stopPrice': new_sl, 'reduceOnly': True, 'trigger': 'mark'}
                 )
                 trade['breakeven_moved'] = True
                 log(f"🔄 [{symbol}] BREAKEVEN TRIGGERED → SL moved to entry {new_sl:.4f}", to_file=True)
             except Exception as e:
                 log(f"⚠️ Breakeven update failed for {symbol}: {e}", to_file=True)
 
-    # Normal SL/TP hit check
     hit = False
     pnl = 0.0
     result = ""
@@ -341,11 +328,11 @@ async def manage_open_trade(symbol, df):
         log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED | PNL: ${pnl:.2f} | Duration: {duration} min", to_file=True)
         del active_trades[symbol]
 
+# (The rest of main() is unchanged from the previous version)
 async def main():
     global daily_trades, daily_pnl, wins, losses, current_day, log_file, last_trade_time
-    log("🚀 1m CHOCH + Ranked FVG + 15m Bias + Cooldown + Breakeven + Live Stats Header\n", to_file=True)
+    log("🚀 Full Video Strategy + Detailed Position Logging + Live Stats Header\n", to_file=True)
 
-    # (rest of main() is identical to the previous working version)
     try:
         positions = exchange.fetch_positions()
         for pos in positions:
@@ -491,8 +478,8 @@ if __name__ == "__main__":
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Live Stats Header + Breakeven")
-    log(f"Symbols: {SYMBOLS} | Full Video Strategy + Ranking + Breakeven\n", to_file=True)
+    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Detailed Position Logging")
+    log(f"Symbols: {SYMBOLS} | Full Video Strategy + Ranking + Breakeven + Full Position Summary\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
