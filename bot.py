@@ -39,7 +39,7 @@ exchange.set_sandbox_mode(USE_TESTNET)
 
 # ====================== LOGGING SETUP ======================
 log_file = f"trading_log_{date.today()}.txt"
-recent_logs = deque(maxlen=2000)  # In-memory buffer for instant live updates
+recent_logs = deque(maxlen=2000)  # In-memory buffer → instant live updates
 
 def log(message, to_file=True):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -87,11 +87,10 @@ def show_log():
                 }}
                 .header {{ color: #569cd6; }}
                 .info {{ font-size: 13px; color: #888; margin-bottom: 15px; }}
-                .success {{ color: #4ade80; }}
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (NOW FIXED ✅)</h2>
+            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (STABLE ✅)</h2>
             <div class="info">
                 ✅ In-memory live updates • Showing last {len(recent_logs)} lines • Auto-refreshes every 3 seconds<br>
                 Last updated: <span id="timestamp"></span> • Log file: {log_file}
@@ -99,8 +98,6 @@ def show_log():
             <pre id="logpre">{display_content}</pre>
 
             <script>
-                let lastUpdate = Date.now();
-                
                 async function refreshLog() {{
                     try {{
                         const response = await fetch('/raw?' + Date.now(), {{ cache: 'no-store' }});
@@ -116,7 +113,7 @@ def show_log():
                     document.getElementById('timestamp').textContent = new Date().toLocaleString();
                     const pre = document.getElementById('logpre');
                     pre.scrollTop = pre.scrollHeight;
-                    setInterval(refreshLog, 3000);  // Live every 3 seconds
+                    setInterval(refreshLog, 3000);
                 }};
             </script>
         </body>
@@ -132,7 +129,6 @@ def show_log():
 
 @app.route('/raw')
 def raw_log():
-    """Plain text endpoint used by JavaScript for live updates"""
     response = Response("\n".join(recent_logs))
     response.headers['Content-Type'] = 'text/plain'
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
@@ -142,7 +138,7 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ====================== BOT LOGIC (unchanged core) ======================
+# ====================== BOT LOGIC ======================
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
 
@@ -191,7 +187,7 @@ async def fetch_latest_candles(symbol, tf, limit=300):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        log(f"❌ Candle error ({tf}) for {symbol}", to_file=False)
+        log(f"❌ Candle error ({tf}) for {symbol}: {e}", to_file=False)
         return pd.DataFrame()
 
 async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd):
@@ -344,18 +340,20 @@ async def main():
                 current_price = df1m['close'].iloc[-1]
                 atr = calculate_atr(df1m)
 
-                log(f"[{datetime.now().strftime('%H:%M:%S')}] [{symbol}] Price: {current_price:.4f} | ATR: {atr:.4f} | 15m CHOCH: {len(choch_15m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
+                # Clean status log (no double timestamp)
+                log(f"[{symbol}] Price: {current_price:.4f} | ATR: {atr:.4f} | 15m CHOCH: {len(choch_15m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
 
                 await manage_open_trade(symbol, df1m)
 
                 if symbol in active_trades:
                     continue
 
-                latest_choch_idx = choch_15m[-1][0] if choch_15m else 0
+                # FIXED: Use index [1] (the actual candle index) instead of [0] (direction string)
+                latest_choch_idx = choch_15m[-1][1] if choch_15m else -1
 
                 for fvg in fvg_1m[-8:]:
                     fvg_type, midpoint, fvg_extreme, fvg_idx = fvg
-                    if fvg_idx < latest_choch_idx:
+                    if latest_choch_idx != -1 and fvg_idx < latest_choch_idx:
                         continue
                     if abs(current_price - midpoint) / midpoint > 0.003:
                         continue
