@@ -76,9 +76,9 @@ def show_log():
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Breakeven Fixed ✅)</h2>
+            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Breakeven FIXED ✅)</h2>
             <div class="info">
-                ✅ 1m CHOCH + Ranked FVG + 15m Bias + Cooldown + Breakeven Logic<br>
+                ✅ 1m CHOCH + Ranked FVG + 15m Bias + Cooldown + Working Breakeven<br>
                 Last updated: <span id="timestamp"></span>
             </div>
             <pre id="logpre">{display_content}</pre>
@@ -230,7 +230,6 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         return order
     except Exception as e:
         log(f"❌ ORDER FAILED: {e}", to_file=True)
-        log(f"   Traceback: {traceback.format_exc()}", to_file=True)
         return None
 
 async def manage_open_trade(symbol, df):
@@ -239,22 +238,25 @@ async def manage_open_trade(symbol, df):
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
 
-    # === BREAKEVEN LOGIC (fixed for Kraken) ===
+    # === FIXED BREAKEVEN LOGIC (Kraken Futures compatible) ===
     if not trade.get('breakeven_moved', False) and trade.get('choch_level'):
         choch_level = trade['choch_level']
         if (trade['side'] == 'buy' and current_price > choch_level) or \
            (trade['side'] == 'sell' and current_price < choch_level):
             try:
-                # Place new reduceOnly stop at entry price (replaces old SL)
                 new_sl = trade['entry_price']
                 side_for_sl = 'sell' if trade['side'] == 'buy' else 'buy'
+
                 exchange.create_order(
                     symbol=symbol,
-                    type='stop',
+                    type='stopMarket',           # ← Fixed order type
                     side=side_for_sl,
                     amount=trade['quantity'],
-                    price=new_sl,
-                    params={'trigger': 'mark', 'reduceOnly': True}
+                    params={
+                        'stopPrice': new_sl,     # ← Required for Kraken
+                        'reduceOnly': True,
+                        'trigger': 'mark'
+                    }
                 )
                 trade['breakeven_moved'] = True
                 log(f"🔄 [{symbol}] BREAKEVEN TRIGGERED → SL moved to entry {new_sl:.4f}", to_file=True)
@@ -444,7 +446,7 @@ if __name__ == "__main__":
     last_trade_time = None
 
     log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Breakeven FIXED")
-    log(f"Symbols: {SYMBOLS} | Full Video Strategy + Ranking + Breakeven\n", to_file=True)
+    log(f"Symbols: {SYMBOLS} | Full Video Strategy + Ranking + Working Breakeven\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
