@@ -19,7 +19,7 @@ RISK_USD = config.get("risk_usd", 1.0)
 LEVERAGE = config.get("leverage", 5)
 SYMBOLS = config.get("symbols", ["PI_XBTUSD"])
 TIMEFRAME = config.get("timeframe", "1m")
-HTF_TIMEFRAME = "15m"                    # 15m bias
+HTF_TIMEFRAME = "15m"
 WARMUP_MINUTES = config.get("warmup_minutes", 10)
 MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 8)
 MAX_DAILY_LOSS_USD = config.get("max_daily_loss_usd", 5.0)
@@ -45,7 +45,7 @@ def log(message, to_file=True):
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-# Flask for public log viewer on Railway
+# Flask web viewer with auto-refresh
 app = Flask(__name__)
 
 @app.route('/')
@@ -53,9 +53,26 @@ def show_log():
     try:
         with open(log_file, 'r', encoding="utf-8") as f:
             content = f.read()
-        return f"<pre style='font-family: monospace; padding: 15px; line-height: 1.4; white-space: pre-wrap;'>{content}</pre>"
+        html = f"""
+        <html>
+        <head>
+            <title>Kraken ICT Bot - Live Log</title>
+            <meta http-equiv="refresh" content="5">
+            <style>
+                body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.5; }}
+                pre {{ white-space: pre-wrap; word-wrap: break-word; }}
+            </style>
+        </head>
+        <body>
+            <h2>🚀 Kraken ICT Bot - Live Trading Log</h2>
+            <p><small>Auto-refresh every 5 seconds</small></p>
+            <pre>{content}</pre>
+        </body>
+        </html>
+        """
+        return html
     except:
-        return "<h2>No log file yet. Bot is starting...</h2>"
+        return "<h2>Bot is starting... Log file not created yet.</h2>"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -216,7 +233,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, wins, losses, current_day
-    log("🚀 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter + Public Log Viewer\n", to_file=True)
+    log("🚀 Final Bot - 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter\n", to_file=True)
 
     # Startup position check
     try:
@@ -292,7 +309,7 @@ async def main():
 
                 for fvg in fvg_1m[-8:]:
                     fvg_type, midpoint, fvg_extreme, fvg_idx = fvg
-                    if fvg_idx < latest_choch_idx:      # Fresh FVG only
+                    if fvg_idx < latest_choch_idx:   # Fresh FVG only
                         continue
                     if abs(current_price - midpoint) / midpoint > 0.003:   # Tighter tolerance
                         continue
