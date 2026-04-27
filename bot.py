@@ -6,8 +6,9 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
-from flask import Flask
+from flask import Flask, Response
 import threading
+import logging
 
 load_dotenv()
 
@@ -35,6 +36,7 @@ exchange = ccxt.krakenfutures({
 })
 exchange.set_sandbox_mode(USE_TESTNET)
 
+# ====================== LOGGING SETUP ======================
 log_file = f"trading_log_{date.today()}.txt"
 
 def log(message, to_file=True):
@@ -42,63 +44,85 @@ def log(message, to_file=True):
     line = f"[{timestamp}] {message}"
     print(line)
     if to_file:
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())  # Force immediate write to disk
+        except Exception as e:
+            print(f"[LOG ERROR] {e}")
 
-# ====================== Flask Live Log Viewer ======================
+# ====================== FLASK LIVE VIEWER ======================
 app = Flask(__name__)
+
+# Disable Flask/Werkzeug access logs (cleans up console spam)
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 @app.route('/')
 def show_log():
     try:
         with open(log_file, 'r', encoding="utf-8") as f:
-            content = f.read()
+            lines = f.readlines()
+        
+        # SHOW ONLY LAST 800 LINES - prevents huge/slow pages
+        display_content = ''.join(lines[-800:])
+        
         html = f"""
         <html>
         <head>
             <title>Kraken ICT Bot - Live Log</title>
-            <meta http-equiv="refresh" content="5">
+            <meta http-equiv="refresh" content="4">
             <style>
-                body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.5; margin: 0; }}
-                pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 14px; }}
+                body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.4; margin: 0; }}
+                pre {{ 
+                    white-space: pre-wrap; 
+                    word-wrap: break-word; 
+                    font-size: 13px; 
+                    max-height: 88vh;
+                    overflow-y: auto;
+                    background: #252526;
+                    padding: 15px;
+                    border-radius: 6px;
+                    border: 1px solid #3c3c3c;
+                }}
                 .header {{ color: #569cd6; }}
+                .info {{ font-size: 13px; color: #888; margin-bottom: 10px; }}
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - Live Trading Log</h2>
-            <p><small>Auto-refresh every 5 seconds • Last updated: {datetime.now().strftime('%H:%M:%S')}</small></p>
-            <pre>{content}</pre>
+            <h2 class="header">🚀 Kraken ICT Bot - Live Trading Log (FIXED ✅)</h2>
+            <div class="info">
+                Auto-refresh every 4s • Showing last 800 lines • Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
+                <small>Log file: {log_file} | Total lines: {len(lines)}</small>
+            </div>
+            <pre id="logpre">{display_content}</pre>
+            <script>
+                function scrollToBottom() {{
+                    var pre = document.getElementById('logpre');
+                    pre.scrollTop = pre.scrollHeight;
+                }}
+                window.onload = scrollToBottom;
+                setTimeout(scrollToBottom, 100);
+            </script>
         </body>
         </html>
         """
-        return html
-    except:
-        return "<h2>Bot is starting... Log file not created yet.</h2>"
+        response = Response(html)
+        # Prevent browser/proxy caching
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
+    except FileNotFoundError:
+        return "<h2 style='color:#569cd6;'>🤖 Bot is starting... Log file not created yet.</h2>"
+    except Exception as e:
+        return f"<h2 style='color:#f87171;'>Error reading log: {str(e)}</h2>"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# Persistent stats
-def load_stats():
-    if os.path.exists("bot_stats.json"):
-        try:
-            with open("bot_stats.json", 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {"wins": 0, "losses": 0, "total_pnl": 0.0}
-
-stats = load_stats()
-wins = stats.get("wins", 0)
-losses = stats.get("losses", 0)
-daily_pnl = 0.0
-daily_trades = 0
-current_day = date.today()
-
-log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Max Daily Loss: ${MAX_DAILY_LOSS_USD}")
-log(f"Symbols: {SYMBOLS} | 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter\n", to_file=True)
-
+# ====================== REST OF BOT (unchanged except minor fixes) ======================
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
 
@@ -233,7 +257,7 @@ async def manage_open_trade(symbol, df):
         del active_trades[symbol]
 
 async def main():
-    global daily_trades, daily_pnl, wins, losses, current_day
+    global daily_trades, daily_pnl, wins, losses, current_day, log_file
     log("🚀 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter + Live Web Viewer\n", to_file=True)
 
     # Startup position check
@@ -264,6 +288,10 @@ async def main():
             if today != current_day:
                 win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
                 log(f"\n📅 === DAILY SUMMARY ({current_day}) === Trades: {daily_trades} | PNL: ${daily_pnl:.2f} | Win Rate: {win_rate:.1f}% ({wins}W / {losses}L)\n", to_file=True)
+                
+                # IMPORTANT: Update log_file when day changes
+                log_file = f"trading_log_{today}.txt"
+                
                 daily_trades = 0
                 daily_pnl = 0.0
                 wins = 0
@@ -344,6 +372,26 @@ async def main():
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
+    # Persistent stats
+    def load_stats():
+        if os.path.exists("bot_stats.json"):
+            try:
+                with open("bot_stats.json", 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {"wins": 0, "losses": 0, "total_pnl": 0.0}
+
+    stats = load_stats()
+    wins = stats.get("wins", 0)
+    losses = stats.get("losses", 0)
+    daily_pnl = 0.0
+    daily_trades = 0
+    current_day = date.today()
+
+    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Max Daily Loss: ${MAX_DAILY_LOSS_USD}")
+    log(f"Symbols: {SYMBOLS} | 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter\n", to_file=True)
+
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
