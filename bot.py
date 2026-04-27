@@ -76,9 +76,9 @@ def show_log():
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Breakeven + Ranking)</h2>
+            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Breakeven Fixed ✅)</h2>
             <div class="info">
-                ✅ 1m CHOCH + Ranked FVG + 15m Bias + Cooldown Wiggle + Breakeven Logic<br>
+                ✅ 1m CHOCH + Ranked FVG + 15m Bias + Cooldown + Breakeven Logic<br>
                 Last updated: <span id="timestamp"></span>
             </div>
             <pre id="logpre">{display_content}</pre>
@@ -211,7 +211,6 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
 
         log(f"✅ ORDER CREATED | ID: {order.get('id')}", to_file=True)
 
-        # Verify position
         await asyncio.sleep(2)
         positions = exchange.fetch_positions()
         symbol_pos = next((p for p in positions if p['symbol'] == symbol and float(p.get('contracts', 0)) != 0), None)
@@ -231,6 +230,7 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         return order
     except Exception as e:
         log(f"❌ ORDER FAILED: {e}", to_file=True)
+        log(f"   Traceback: {traceback.format_exc()}", to_file=True)
         return None
 
 async def manage_open_trade(symbol, df):
@@ -239,19 +239,19 @@ async def manage_open_trade(symbol, df):
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
 
-    # === BREAKEVEN LOGIC (per transcript) ===
+    # === BREAKEVEN LOGIC (fixed for Kraken) ===
     if not trade.get('breakeven_moved', False) and trade.get('choch_level'):
         choch_level = trade['choch_level']
         if (trade['side'] == 'buy' and current_price > choch_level) or \
            (trade['side'] == 'sell' and current_price < choch_level):
             try:
-                # Move stop loss to entry price
+                # Place new reduceOnly stop at entry price (replaces old SL)
                 new_sl = trade['entry_price']
-                exchange.edit_order(
-                    id=None,  # Kraken uses position-level editing for stops in some cases
+                side_for_sl = 'sell' if trade['side'] == 'buy' else 'buy'
+                exchange.create_order(
                     symbol=symbol,
                     type='stop',
-                    side='sell' if trade['side'] == 'buy' else 'buy',
+                    side=side_for_sl,
                     amount=trade['quantity'],
                     price=new_sl,
                     params={'trigger': 'mark', 'reduceOnly': True}
@@ -297,9 +297,8 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, wins, losses, current_day, log_file, last_trade_time
-    log("🚀 1m CHOCH + Ranked FVG + 15m Bias + Cooldown + Breakeven Logic ACTIVE\n", to_file=True)
+    log("🚀 1m CHOCH + Ranked FVG + 15m Bias + Cooldown + FIXED Breakeven Logic\n", to_file=True)
 
-    # Startup checks (unchanged)
     try:
         positions = exchange.fetch_positions()
         for pos in positions:
@@ -320,7 +319,6 @@ async def main():
         try:
             today = date.today()
             if today != current_day:
-                # daily summary + reset (unchanged)
                 win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
                 log(f"\n📅 === DAILY SUMMARY ({current_day}) === Trades: {daily_trades} | PNL: ${daily_pnl:.2f} | Win Rate: {win_rate:.1f}%", to_file=True)
                 log_file = f"trading_log_{today}.txt"
@@ -345,7 +343,6 @@ async def main():
                 log("✅ Warm-up finished. Starting live trading.", to_file=True)
                 in_warmup = False
 
-            # cooldown & wiggle logic (unchanged)
             can_trade = True
             minutes_since_last = 9999
             if last_trade_time:
@@ -446,7 +443,7 @@ if __name__ == "__main__":
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Breakeven Logic ENABLED")
+    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Breakeven FIXED")
     log(f"Symbols: {SYMBOLS} | Full Video Strategy + Ranking + Breakeven\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
