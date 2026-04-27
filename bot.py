@@ -45,7 +45,7 @@ def log(message, to_file=True):
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-# Flask web viewer with auto-refresh
+# ====================== Flask Live Log Viewer ======================
 app = Flask(__name__)
 
 @app.route('/')
@@ -59,13 +59,14 @@ def show_log():
             <title>Kraken ICT Bot - Live Log</title>
             <meta http-equiv="refresh" content="5">
             <style>
-                body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.5; }}
-                pre {{ white-space: pre-wrap; word-wrap: break-word; }}
+                body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.5; margin: 0; }}
+                pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 14px; }}
+                .header {{ color: #569cd6; }}
             </style>
         </head>
         <body>
-            <h2>🚀 Kraken ICT Bot - Live Trading Log</h2>
-            <p><small>Auto-refresh every 5 seconds</small></p>
+            <h2 class="header">🚀 Kraken ICT Bot - Live Trading Log</h2>
+            <p><small>Auto-refresh every 5 seconds • Last updated: {datetime.now().strftime('%H:%M:%S')}</small></p>
             <pre>{content}</pre>
         </body>
         </html>
@@ -233,7 +234,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, wins, losses, current_day
-    log("🚀 Final Bot - 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter\n", to_file=True)
+    log("🚀 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter + Live Web Viewer\n", to_file=True)
 
     # Startup position check
     try:
@@ -309,12 +310,11 @@ async def main():
 
                 for fvg in fvg_1m[-8:]:
                     fvg_type, midpoint, fvg_extreme, fvg_idx = fvg
-                    if fvg_idx < latest_choch_idx:   # Fresh FVG only
+                    if fvg_idx < latest_choch_idx:
                         continue
-                    if abs(current_price - midpoint) / midpoint > 0.003:   # Tighter tolerance
+                    if abs(current_price - midpoint) / midpoint > 0.003:
                         continue
 
-                    # Momentum filter
                     recent_candle = df1m.iloc[-1]
                     if fvg_type == 'bullish' and recent_candle['close'] <= recent_candle['open']:
                         continue
@@ -344,10 +344,9 @@ async def main():
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    # Start Flask web server in background
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    log(f"🌐 Public log viewer running at http://0.0.0.0:{os.environ.get('PORT', 8080)}", to_file=True)
+    log(f"🌐 Public live log viewer running at http://0.0.0.0:{os.environ.get('PORT', 8080)}", to_file=True)
 
     asyncio.run(main())
