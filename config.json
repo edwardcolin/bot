@@ -4,7 +4,7 @@
   "symbols": ["PI_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_DOGEUSD", "PF_XRPUSD"],
   "timeframe": "1m",
   "warmup_minutes": 0,
-  "max_trades_per_day": 8,
+  "max_trades_per_day": 35,
   "max_daily_loss_usd": 5.0,
   "stop_buffer_ticks": 5,
   "rr_ratio": 4.0,
