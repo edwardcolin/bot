@@ -74,9 +74,9 @@ def show_log():
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (15m Bias + Cooldown)</h2>
+            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Advanced Ranking + Wiggle)</h2>
             <div class="info">
-                ✅ 1m CHOCH + Fresh FVG + Strong 15m Bias + Auto Cooldown<br>
+                ✅ Multi-factor FVG/CHOCH ranking • Daily history tracking • 25% cooldown wiggle for elite setups<br>
                 Last updated: <span id="timestamp"></span>
             </div>
             <pre id="logpre">{display_content}</pre>
@@ -123,7 +123,8 @@ def run_flask():
 # ====================== BOT LOGIC ======================
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
-last_trade_time = None  # Global cooldown for quality control
+last_trade_time = None
+daily_setups = deque(maxlen=300)  # Track all potential setups in last 24h for ranking
 
 def calculate_atr(df, period=14):
     high_low = df['high'] - df['low']
@@ -158,10 +159,20 @@ def detect_fvg(df):
     fvgs = []
     for i in range(2, len(df)):
         if df['high'].iloc[i-2] < df['low'].iloc[i]:
-            fvgs.append(('bullish', (df['low'].iloc[i] + df['high'].iloc[i-2])/2, df['low'].iloc[i-1], i))
+            fvgs.append(('bullish', (df['low'].iloc[i] + df['high'].iloc[i-2])/2, df['low'].iloc[i-1], i, df['high'].iloc[i-2], df['low'].iloc[i]))
         if df['low'].iloc[i-2] > df['high'].iloc[i]:
-            fvgs.append(('bearish', (df['high'].iloc[i] + df['low'].iloc[i-2])/2, df['high'].iloc[i-1], i))
+            fvgs.append(('bearish', (df['high'].iloc[i] + df['low'].iloc[i-2])/2, df['high'].iloc[i-1], i, df['low'].iloc[i-2], df['high'].iloc[i]))
     return fvgs
+
+def score_fvg(fvg, current_price, df, is_1m=True):
+    fvg_type, midpoint, fvg_extreme, fvg_idx, fvg_start, fvg_end = fvg
+    age = len(df) - fvg_idx
+    size = abs(fvg_end - fvg_start)
+    proximity = abs(current_price - midpoint) / midpoint
+    momentum = 1 if (fvg_type == 'bullish' and df['close'].iloc[-1] > df['open'].iloc[-1]) else 1 if (fvg_type == 'bearish' and df['close'].iloc[-1] < df['open'].iloc[-1]) else 0.6
+    freshness = max(0.3, 1 - age / 30)  # newer = better
+    score = (1 - proximity) * 40 + freshness * 30 + (size / df['close'].iloc[-1]) * 20 + momentum * 10
+    return round(score, 2)
 
 async def fetch_latest_candles(symbol, tf, limit=500):
     try:
@@ -173,92 +184,54 @@ async def fetch_latest_candles(symbol, tf, limit=500):
         log(f"❌ Candle error ({tf}) for {symbol}: {e}", to_file=False)
         return pd.DataFrame()
 
-async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd):
+async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd, score):
+    # ... (same as previous version - omitted for brevity, copy from last full version if needed)
     try:
         m = exchange.market(symbol)
         min_amount = m.get('limits', {}).get('amount', {}).get('min') or 1.0
         quantity = max(min_amount, round((risk_usd * LEVERAGE) / abs(current_price - stop_price), 4))
         quantity = min(quantity, 2000)
-
         limit_price = current_price * (1.003 if side == 'buy' else 0.997)
 
-        params = {
-            'leverage': LEVERAGE,
-            'stopLoss': {'type': 'stop', 'price': stop_price, 'trigger': 'mark'},
-            'takeProfit': {'type': 'takeProfit', 'price': tp_price, 'trigger': 'mark'}
-        }
+        params = {'leverage': LEVERAGE, 'stopLoss': {'type': 'stop', 'price': stop_price, 'trigger': 'mark'}, 'takeProfit': {'type': 'takeProfit', 'price': tp_price, 'trigger': 'mark'}}
 
-        log(f"📊 [{symbol}] Placing {side.upper()} LIMIT | Qty: {quantity:.2f}", to_file=True)
-
-        order = exchange.create_order(
-            symbol=symbol,
-            type='limit',
-            side=side,
-            amount=quantity,
-            price=limit_price,
-            params=params
-        )
-
-        active_trades[symbol] = {
-            'side': side,
-            'entry_price': float(current_price),
-            'stop_price': float(stop_price),
-            'tp_price': float(tp_price),
-            'quantity': float(quantity),
-            'open_time': datetime.now()
-        }
-
-        log(f"✅ [{symbol}] {side.upper()} POSITION OPENED", to_file=True)
+        log(f"📊 [{symbol}] Placing {side.upper()} | Score: {score:.1f} | Qty: {quantity:.2f}", to_file=True)
+        order = exchange.create_order(symbol=symbol, type='limit', side=side, amount=quantity, price=limit_price, params=params)
+        active_trades[symbol] = {'side': side, 'entry_price': float(current_price), 'stop_price': float(stop_price), 'tp_price': float(tp_price), 'quantity': float(quantity), 'open_time': datetime.now()}
+        log(f"✅ [{symbol}] {side.upper()} POSITION OPENED (Score: {score:.1f})", to_file=True)
         return order
     except Exception as e:
         log(f"❌ [{symbol}] Order failed: {e}", to_file=True)
         return None
 
 async def manage_open_trade(symbol, df):
+    # (unchanged from previous version)
     if symbol not in active_trades:
         return
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
-
     hit = False
     pnl = 0.0
     result = ""
-
     if trade['side'] == 'sell':
-        if current_price >= trade['stop_price']:
-            pnl = RISK_USD * -1
-            result = "LOSS"
-            hit = True
-        elif current_price <= trade['tp_price']:
-            pnl = RISK_USD * RR_RATIO
-            result = "WIN"
-            hit = True
+        if current_price >= trade['stop_price']: pnl = RISK_USD * -1; result = "LOSS"; hit = True
+        elif current_price <= trade['tp_price']: pnl = RISK_USD * RR_RATIO; result = "WIN"; hit = True
     else:
-        if current_price <= trade['stop_price']:
-            pnl = RISK_USD * -1
-            result = "LOSS"
-            hit = True
-        elif current_price >= trade['tp_price']:
-            pnl = RISK_USD * RR_RATIO
-            result = "WIN"
-            hit = True
-
+        if current_price <= trade['stop_price']: pnl = RISK_USD * -1; result = "LOSS"; hit = True
+        elif current_price >= trade['tp_price']: pnl = RISK_USD * RR_RATIO; result = "WIN"; hit = True
     if hit:
         global daily_pnl, wins, losses
         daily_pnl += pnl
-        if result == "WIN":
-            wins += 1
-        else:
-            losses += 1
+        if result == "WIN": wins += 1
+        else: losses += 1
         duration = (datetime.now() - trade['open_time']).seconds // 60
         log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED | PNL: ${pnl:.2f} | Duration: {duration} min", to_file=True)
         del active_trades[symbol]
 
 async def main():
     global daily_trades, daily_pnl, wins, losses, current_day, log_file, last_trade_time
-    log("🚀 1m CHOCH + Fresh FVG + Strong 15m Bias + Auto Cooldown (Video Strategy Enhanced)\n", to_file=True)
+    log("🚀 Advanced Multi-Factor Ranking + Daily History + 25% Wiggle Cooldown\n", to_file=True)
 
-    # Startup checks (unchanged)
     try:
         positions = exchange.fetch_positions()
         for pos in positions:
@@ -272,10 +245,9 @@ async def main():
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
-
-    # Calculate cooldown (e.g. 8 trades/day = ~3 hours between trades)
     cooldown_minutes = 1440 / MAX_TRADES_PER_DAY
-    log(f"Cooldown set to {cooldown_minutes:.1f} minutes between trades (based on {MAX_TRADES_PER_DAY} max/day)", to_file=True)
+    wiggle_minutes = cooldown_minutes * 0.25
+    log(f"Cooldown: {cooldown_minutes:.1f} min | Wiggle window: ±{wiggle_minutes:.1f} min for elite setups", to_file=True)
 
     while True:
         try:
@@ -289,10 +261,11 @@ async def main():
                 wins = 0
                 losses = 0
                 current_day = today
-                last_trade_time = None  # Reset cooldown on new day
+                daily_setups.clear()
+                last_trade_time = None
 
             if daily_pnl <= -MAX_DAILY_LOSS_USD:
-                log(f"🚫 Daily max loss reached. Paused for today.", to_file=True)
+                log(f"🚫 Daily max loss reached. Paused.", to_file=True)
                 await asyncio.sleep(3600)
                 continue
 
@@ -304,16 +277,16 @@ async def main():
                 log("✅ Warm-up finished. Starting live trading.", to_file=True)
                 in_warmup = False
 
-            # Cooldown check
             can_trade = True
-            if last_trade_time is not None:
+            minutes_since_last = 9999
+            if last_trade_time:
                 minutes_since_last = (datetime.now() - last_trade_time).total_seconds() / 60
-                if minutes_since_last < cooldown_minutes:
+                if minutes_since_last < cooldown_minutes - wiggle_minutes:
                     can_trade = False
-                    log(f"⏳ Cooldown active: {minutes_since_last:.1f}/{cooldown_minutes:.1f} min since last trade", to_file=False)
 
             best_setup = None
             best_score = -999
+            best_symbol = None
 
             for symbol in SYMBOLS:
                 df1m = await fetch_latest_candles(symbol, TIMEFRAME)
@@ -327,54 +300,62 @@ async def main():
                 fvg_1m = detect_fvg(df1m)
 
                 current_price = df1m['close'].iloc[-1]
-                atr = calculate_atr(df1m)
-
                 latest_15m_bias = choch_15m[-1][0] if choch_15m else None
 
-                log(f"[{symbol}] Price: {current_price:.4f} | 15m Bias: {latest_15m_bias or 'NONE'} | 15m CHOCH: {len(choch_15m)} | 1m CHOCH: {len(choch_1m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
+                log(f"[{symbol}] Price: {current_price:.4f} | 15m Bias: {latest_15m_bias or 'NONE'} | 1m CHOCH: {len(choch_1m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
 
                 await manage_open_trade(symbol, df1m)
-                if symbol in active_trades or not can_trade:
+                if symbol in active_trades:
                     continue
 
                 latest_choch_1m_idx = choch_1m[-1][1] if choch_1m else -1
 
-                for fvg in fvg_1m[-10:]:
-                    fvg_type, midpoint, fvg_extreme, fvg_idx = fvg
-
-                    # Must be fresh after 1m CHOCH
+                for fvg in fvg_1m[-12:]:
+                    fvg_type, midpoint, fvg_extreme, fvg_idx, _, _ = fvg
                     if latest_choch_1m_idx != -1 and fvg_idx < latest_choch_1m_idx:
                         continue
-
-                    # Must match current 15m bias (strong filter)
                     if latest_15m_bias and fvg_type != latest_15m_bias:
                         continue
 
+                    score = score_fvg(fvg, current_price, df1m)
+
+                    # Record for daily ranking
+                    daily_setups.append({'time': datetime.now(), 'symbol': symbol, 'score': score, 'fvg_type': fvg_type, 'price': current_price})
+
                     if abs(current_price - midpoint) / midpoint > 0.003:
                         continue
-
                     recent_candle = df1m.iloc[-1]
                     if (fvg_type == 'bullish' and recent_candle['close'] <= recent_candle['open']) or \
                        (fvg_type == 'bearish' and recent_candle['close'] >= recent_candle['open']):
                         continue
 
-                    score = 100 - (abs(current_price - midpoint) / midpoint * 1000)
                     if score > best_score:
                         best_score = score
-                        best_setup = (symbol, fvg_type, current_price, fvg_extreme, ATR_MULTIPLIER * atr)
+                        best_setup = (symbol, fvg_type, current_price, fvg_extreme, ATR_MULTIPLIER * calculate_atr(df1m))
+                        best_symbol = symbol
 
-            if best_setup and daily_trades < MAX_TRADES_PER_DAY and can_trade:
+            # Wiggle logic for elite setups
+            is_elite = False
+            if daily_setups and best_score > 0:
+                all_scores = [s['score'] for s in daily_setups]
+                percentile = np.percentile(all_scores, 90) if all_scores else 80
+                is_elite = best_score >= percentile or best_score > 92
+
+            allow_by_wiggle = is_elite and minutes_since_last < cooldown_minutes + wiggle_minutes and minutes_since_last > cooldown_minutes - wiggle_minutes
+
+            if best_setup and daily_trades < MAX_TRADES_PER_DAY and (can_trade or allow_by_wiggle):
                 symbol, direction, current_price, fvg_extreme, dynamic_buffer = best_setup
                 if direction == 'bullish':
                     stop_price = fvg_extreme - dynamic_buffer
                     tp_price = current_price + (current_price - stop_price) * RR_RATIO
-                    await place_trade(symbol, 'buy', current_price, stop_price, tp_price, RISK_USD)
+                    await place_trade(symbol, 'buy', current_price, stop_price, tp_price, RISK_USD, best_score)
                 else:
                     stop_price = fvg_extreme + dynamic_buffer
                     tp_price = current_price - (stop_price - current_price) * RR_RATIO
-                    await place_trade(symbol, 'sell', current_price, stop_price, tp_price, RISK_USD)
+                    await place_trade(symbol, 'sell', current_price, stop_price, tp_price, RISK_USD, best_score)
                 daily_trades += 1
                 last_trade_time = datetime.now()
+                log(f"🚀 ELITE SETUP TAKEN (Score: {best_score:.1f} | Wiggle: {allow_by_wiggle})", to_file=True)
 
             await asyncio.sleep(25)
         except Exception as e:
@@ -399,8 +380,8 @@ if __name__ == "__main__":
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Cooldown: {1440/MAX_TRADES_PER_DAY:.1f} min")
-    log(f"Symbols: {SYMBOLS} | 1m CHOCH + Fresh FVG + Strong 15m Bias + Spacing\n", to_file=True)
+    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Advanced Ranking + Wiggle Active")
+    log(f"Symbols: {SYMBOLS} | 1m CHOCH + Ranked FVG + 15m Bias + 25% Wiggle\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
