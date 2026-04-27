@@ -17,7 +17,7 @@ RISK_USD = config.get("risk_usd", 1.0)
 LEVERAGE = config.get("leverage", 5)
 SYMBOLS = config.get("symbols", ["PI_XBTUSD"])
 TIMEFRAME = config.get("timeframe", "1m")
-HTF_TIMEFRAME = "5m"
+HTF_TIMEFRAME = "15m"
 WARMUP_MINUTES = config.get("warmup_minutes", 10)
 MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 8)
 MAX_DAILY_LOSS_USD = config.get("max_daily_loss_usd", 5.0)
@@ -34,7 +34,6 @@ exchange = ccxt.krakenfutures({
 exchange.set_sandbox_mode(USE_TESTNET)
 
 log_file = f"trading_log_{date.today()}.txt"
-stats_file = "bot_stats.json"
 
 def log(message, to_file=True):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -46,9 +45,9 @@ def log(message, to_file=True):
 
 # Load persistent stats
 def load_stats():
-    if os.path.exists(stats_file):
+    if os.path.exists("bot_stats.json"):
         try:
-            with open(stats_file, 'r') as f:
+            with open("bot_stats.json", 'r') as f:
                 return json.load(f)
         except:
             pass
@@ -61,8 +60,8 @@ daily_pnl = 0.0
 daily_trades = 0
 current_day = date.today()
 
-log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Max Daily Loss: ${MAX_DAILY_LOSS_USD} | Warm-up: {WARMUP_MINUTES} min", to_file=True)
-log(f"Symbols: {SYMBOLS}\n", to_file=True)
+log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Max Daily Loss: ${MAX_DAILY_LOSS_USD}")
+log(f"Symbols: {SYMBOLS} | 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter\n", to_file=True)
 
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
@@ -100,9 +99,9 @@ def detect_fvg(df):
     fvgs = []
     for i in range(2, len(df)):
         if df['high'].iloc[i-2] < df['low'].iloc[i]:
-            fvgs.append(('bullish', (df['low'].iloc[i] + df['high'].iloc[i-2])/2, df['low'].iloc[i-1]))
+            fvgs.append(('bullish', (df['low'].iloc[i] + df['high'].iloc[i-2])/2, df['low'].iloc[i-1], i))
         if df['low'].iloc[i-2] > df['high'].iloc[i]:
-            fvgs.append(('bearish', (df['high'].iloc[i] + df['low'].iloc[i-2])/2, df['high'].iloc[i-1]))
+            fvgs.append(('bearish', (df['high'].iloc[i] + df['low'].iloc[i-2])/2, df['high'].iloc[i-1], i))
     return fvgs
 
 async def fetch_latest_candles(symbol, tf, limit=300):
@@ -146,7 +145,8 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             'entry_price': float(current_price),
             'stop_price': float(stop_price),
             'tp_price': float(tp_price),
-            'quantity': float(quantity)
+            'quantity': float(quantity),
+            'open_time': datetime.now()
         }
 
         log(f"✅ [{symbol}] {side.upper()} POSITION + REAL SL/TP PLACED | Qty: {quantity:.2f} | SL: {stop_price:.4f} | TP: {tp_price:.4f}")
@@ -197,25 +197,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, wins, losses, current_day
-    log("🚀 Final Bot with Clean Trading Log + Persistent Stats + Startup Position Check\n")
-
-    # Startup position check
-    try:
-        positions = exchange.fetch_positions()
-        for pos in positions:
-            if float(pos.get('contracts', 0)) != 0:
-                symbol = pos['symbol']
-                side = 'buy' if float(pos['contracts']) > 0 else 'sell'
-                log(f"🔄 Found existing {side.upper()} position on {symbol} - added to management", to_file=True)
-                active_trades[symbol] = {
-                    'side': side,
-                    'entry_price': float(pos.get('entryPrice', 0)),
-                    'stop_price': 0,
-                    'tp_price': 0,
-                    'quantity': abs(float(pos['contracts']))
-                }
-    except Exception as e:
-        log(f"Warning: Could not load existing positions: {e}", to_file=True)
+    log("🚀 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter Running...\n")
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
@@ -233,16 +215,16 @@ async def main():
                 current_day = today
 
             if daily_pnl <= -MAX_DAILY_LOSS_USD:
-                log(f"🚫 Daily max loss of ${MAX_DAILY_LOSS_USD} reached. Bot paused for today.", to_file=True)
+                log(f"🚫 Daily max loss of ${MAX_DAILY_LOSS_USD} reached. Bot paused for today.")
                 await asyncio.sleep(3600)
                 continue
 
             if in_warmup and datetime.now() < warmup_end:
-                log(f"   ⏳ Warm-up active ({(warmup_end - datetime.now()).seconds//60} min left)", to_file=False)
+                log(f"   ⏳ Warm-up active ({(warmup_end - datetime.now()).seconds//60} min left)")
                 await asyncio.sleep(25)
                 continue
             elif in_warmup:
-                log("✅ Warm-up finished. Starting live trading.", to_file=True)
+                log("✅ Warm-up finished. Starting live trading.")
                 in_warmup = False
 
             best_setup = None
@@ -250,38 +232,46 @@ async def main():
 
             for symbol in SYMBOLS:
                 df1m = await fetch_latest_candles(symbol, TIMEFRAME)
-                df5m = await fetch_latest_candles(symbol, HTF_TIMEFRAME, limit=200)
+                df15m = await fetch_latest_candles(symbol, HTF_TIMEFRAME, limit=200)
 
-                if len(df1m) < 100 or len(df5m) < 50:
+                if len(df1m) < 100 or len(df15m) < 50:
                     continue
 
                 candle_data[symbol] = df1m
-                choch_5m = detect_choch(df5m)
+                choch_15m = detect_choch(df15m)
                 fvg_1m = detect_fvg(df1m)
                 current_price = df1m['close'].iloc[-1]
                 atr = calculate_atr(df1m)
 
-                # Verbose console only
-                log(f"[{datetime.now().strftime('%H:%M:%S')}] [{symbol}] Price: {current_price:.4f} | ATR: {atr:.4f} | 5m CHOCH: {len(choch_5m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
+                log(f"[{datetime.now().strftime('%H:%M:%S')}] [{symbol}] Price: {current_price:.4f} | ATR: {atr:.4f} | 15m CHOCH: {len(choch_15m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
 
                 await manage_open_trade(symbol, df1m)
 
                 if symbol in active_trades:
                     continue
 
-                for signal in choch_5m[-3:]:
-                    direction, _, _ = signal
-                    for fvg in fvg_1m[-6:]:
-                        fvg_type, midpoint, fvg_extreme = fvg
-                        if direction != fvg_type:
-                            continue
-                        if abs(current_price - midpoint) / midpoint > 0.005:
-                            continue
+                # Fresh FVG + Momentum Filter + Tighter Tolerance
+                latest_choch_idx = choch_15m[-1][1] if choch_15m else 0   # Fixed unpacking
 
-                        score = 100 - (abs(current_price - midpoint) / midpoint * 1000)
-                        if score > best_score:
-                            best_score = score
-                            best_setup = (symbol, direction, current_price, fvg_extreme, ATR_MULTIPLIER * atr)
+                for fvg in fvg_1m[-8:]:
+                    fvg_type, midpoint, fvg_extreme, fvg_idx = fvg
+                    if fvg_idx < latest_choch_idx:   # Only fresh FVGs after latest CHOCH
+                        continue
+
+                    if abs(current_price - midpoint) / midpoint > 0.003:   # Tighter tolerance
+                        continue
+
+                    # Momentum filter - entry candle should be strong in the direction
+                    recent_candle = df1m.iloc[-1]
+                    if fvg_type == 'bullish' and recent_candle['close'] <= recent_candle['open']:
+                        continue
+                    if fvg_type == 'bearish' and recent_candle['close'] >= recent_candle['open']:
+                        continue
+
+                    score = 100 - (abs(current_price - midpoint) / midpoint * 1000)
+                    if score > best_score:
+                        best_score = score
+                        best_setup = (symbol, fvg_type, current_price, fvg_extreme, ATR_MULTIPLIER * atr)
 
             if best_setup and daily_trades < MAX_TRADES_PER_DAY:
                 symbol, direction, current_price, fvg_extreme, dynamic_buffer = best_setup
