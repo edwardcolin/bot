@@ -6,6 +6,8 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
+from flask import Flask, Response
+import threading
 
 load_dotenv()
 
@@ -43,7 +45,23 @@ def log(message, to_file=True):
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-# Load persistent stats
+# Flask web server for public log viewing
+app = Flask(__name__)
+
+@app.route('/')
+def show_log():
+    try:
+        with open(log_file, 'r', encoding="utf-8") as f:
+            content = f.read()
+        return f"<pre style='font-family: monospace; padding: 20px;'>{content}</pre>"
+    except:
+        return "<h2>No log file yet. Bot is starting...</h2>"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# Persistent stats
 def load_stats():
     if os.path.exists("bot_stats.json"):
         try:
@@ -61,11 +79,12 @@ daily_trades = 0
 current_day = date.today()
 
 log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Max Daily Loss: ${MAX_DAILY_LOSS_USD}")
-log(f"Symbols: {SYMBOLS} | 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter\n", to_file=True)
+log(f"Symbols: {SYMBOLS} | 15m Bias + Fresh FVG + Momentum Filter\n", to_file=True)
 
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
 
+# ==================== Strategy Functions ====================
 def calculate_atr(df, period=14):
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
@@ -111,7 +130,7 @@ async def fetch_latest_candles(symbol, tf, limit=300):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        log(f"❌ Candle error ({tf}) for {symbol}: {e}", to_file=False)
+        log(f"❌ Candle error ({tf}) for {symbol}", to_file=False)
         return pd.DataFrame()
 
 async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd):
@@ -129,7 +148,7 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             'takeProfit': {'type': 'takeProfit', 'price': tp_price, 'trigger': 'mark'}
         }
 
-        log(f"📊 [{symbol}] Placing {side.upper()} LIMIT | Qty: {quantity:.2f} | Limit: {limit_price:.4f}")
+        log(f"📊 [{symbol}] Placing {side.upper()} LIMIT | Qty: {quantity:.2f} | Limit: {limit_price:.4f}", to_file=True)
 
         order = exchange.create_order(
             symbol=symbol,
@@ -149,10 +168,10 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             'open_time': datetime.now()
         }
 
-        log(f"✅ [{symbol}] {side.upper()} POSITION + REAL SL/TP PLACED | Qty: {quantity:.2f} | SL: {stop_price:.4f} | TP: {tp_price:.4f}")
+        log(f"✅ [{symbol}] {side.upper()} POSITION + REAL SL/TP PLACED | Qty: {quantity:.2f} | SL: {stop_price:.4f} | TP: {tp_price:.4f}", to_file=True)
         return order
     except Exception as e:
-        log(f"❌ [{symbol}] Order failed: {e}")
+        log(f"❌ [{symbol}] Order failed: {e}", to_file=True)
         return None
 
 async def manage_open_trade(symbol, df):
@@ -192,13 +211,15 @@ async def manage_open_trade(symbol, df):
         else:
             losses += 1
 
-        log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} | PNL: ${pnl:.2f} | Total PNL today: ${daily_pnl:.2f} | Win Rate: {wins/(wins+losses)*100:.1f}% ({wins}W / {losses}L)")
+        duration = (datetime.now() - trade['open_time']).seconds // 60
+        log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED | PNL: ${pnl:.2f} | Duration: {duration} min", to_file=True)
         del active_trades[symbol]
 
 async def main():
     global daily_trades, daily_pnl, wins, losses, current_day
-    log("🚀 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter Running...\n")
+    log("🚀 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter + Public Log Viewer\n", to_file=True)
 
+    # Warm-up
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
 
@@ -215,16 +236,16 @@ async def main():
                 current_day = today
 
             if daily_pnl <= -MAX_DAILY_LOSS_USD:
-                log(f"🚫 Daily max loss of ${MAX_DAILY_LOSS_USD} reached. Bot paused for today.")
+                log(f"🚫 Daily max loss of ${MAX_DAILY_LOSS_USD} reached. Bot paused for today.", to_file=True)
                 await asyncio.sleep(3600)
                 continue
 
             if in_warmup and datetime.now() < warmup_end:
-                log(f"   ⏳ Warm-up active ({(warmup_end - datetime.now()).seconds//60} min left)")
+                log(f"   ⏳ Warm-up active ({(warmup_end - datetime.now()).seconds//60} min left)", to_file=False)
                 await asyncio.sleep(25)
                 continue
             elif in_warmup:
-                log("✅ Warm-up finished. Starting live trading.")
+                log("✅ Warm-up finished. Starting live trading.", to_file=True)
                 in_warmup = False
 
             best_setup = None
@@ -250,18 +271,15 @@ async def main():
                 if symbol in active_trades:
                     continue
 
-                # Fresh FVG + Momentum Filter + Tighter Tolerance
-                latest_choch_idx = choch_15m[-1][1] if choch_15m else 0   # Fixed unpacking
+                latest_choch_idx = choch_15m[-1][0] if choch_15m else 0
 
                 for fvg in fvg_1m[-8:]:
                     fvg_type, midpoint, fvg_extreme, fvg_idx = fvg
-                    if fvg_idx < latest_choch_idx:   # Only fresh FVGs after latest CHOCH
+                    if fvg_idx < latest_choch_idx:
+                        continue
+                    if abs(current_price - midpoint) / midpoint > 0.003:
                         continue
 
-                    if abs(current_price - midpoint) / midpoint > 0.003:   # Tighter tolerance
-                        continue
-
-                    # Momentum filter - entry candle should be strong in the direction
                     recent_candle = df1m.iloc[-1]
                     if fvg_type == 'bullish' and recent_candle['close'] <= recent_candle['open']:
                         continue
@@ -291,9 +309,10 @@ async def main():
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log("\n\nBot stopped by user.")
-    except Exception as e:
-        log(f"Unexpected error: {e}")
+    # Start Flask web server in background thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    log(f"🌐 Public log viewer running at http://0.0.0.0:{os.environ.get('PORT', 8080)}", to_file=True)
+
+    asyncio.run(main())
