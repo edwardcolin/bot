@@ -6,7 +6,7 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
-from flask import Flask, Response
+from flask import Flask
 import threading
 
 load_dotenv()
@@ -19,7 +19,7 @@ RISK_USD = config.get("risk_usd", 1.0)
 LEVERAGE = config.get("leverage", 5)
 SYMBOLS = config.get("symbols", ["PI_XBTUSD"])
 TIMEFRAME = config.get("timeframe", "1m")
-HTF_TIMEFRAME = "15m"
+HTF_TIMEFRAME = "15m"                    # 15m bias
 WARMUP_MINUTES = config.get("warmup_minutes", 10)
 MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 8)
 MAX_DAILY_LOSS_USD = config.get("max_daily_loss_usd", 5.0)
@@ -45,7 +45,7 @@ def log(message, to_file=True):
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-# Flask web server for public log viewing
+# Flask for public log viewer on Railway
 app = Flask(__name__)
 
 @app.route('/')
@@ -53,7 +53,7 @@ def show_log():
     try:
         with open(log_file, 'r', encoding="utf-8") as f:
             content = f.read()
-        return f"<pre style='font-family: monospace; padding: 20px;'>{content}</pre>"
+        return f"<pre style='font-family: monospace; padding: 15px; line-height: 1.4; white-space: pre-wrap;'>{content}</pre>"
     except:
         return "<h2>No log file yet. Bot is starting...</h2>"
 
@@ -79,12 +79,11 @@ daily_trades = 0
 current_day = date.today()
 
 log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Max Daily Loss: ${MAX_DAILY_LOSS_USD}")
-log(f"Symbols: {SYMBOLS} | 15m Bias + Fresh FVG + Momentum Filter\n", to_file=True)
+log(f"Symbols: {SYMBOLS} | 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter\n", to_file=True)
 
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
 
-# ==================== Strategy Functions ====================
 def calculate_atr(df, period=14):
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
@@ -219,7 +218,25 @@ async def main():
     global daily_trades, daily_pnl, wins, losses, current_day
     log("🚀 15m Bias + Fresh FVG + Tighter Entry + Momentum Filter + Public Log Viewer\n", to_file=True)
 
-    # Warm-up
+    # Startup position check
+    try:
+        positions = exchange.fetch_positions()
+        for pos in positions:
+            if float(pos.get('contracts', 0)) != 0:
+                symbol = pos['symbol']
+                side = 'buy' if float(pos['contracts']) > 0 else 'sell'
+                log(f"🔄 Found existing {side.upper()} position on {symbol} - added to management", to_file=True)
+                active_trades[symbol] = {
+                    'side': side,
+                    'entry_price': float(pos.get('entryPrice', 0)),
+                    'stop_price': 0,
+                    'tp_price': 0,
+                    'quantity': abs(float(pos['contracts'])),
+                    'open_time': datetime.now()
+                }
+    except Exception as e:
+        log(f"Warning: Could not load existing positions: {e}", to_file=True)
+
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
 
@@ -275,11 +292,12 @@ async def main():
 
                 for fvg in fvg_1m[-8:]:
                     fvg_type, midpoint, fvg_extreme, fvg_idx = fvg
-                    if fvg_idx < latest_choch_idx:
+                    if fvg_idx < latest_choch_idx:      # Fresh FVG only
                         continue
-                    if abs(current_price - midpoint) / midpoint > 0.003:
+                    if abs(current_price - midpoint) / midpoint > 0.003:   # Tighter tolerance
                         continue
 
+                    # Momentum filter
                     recent_candle = df1m.iloc[-1]
                     if fvg_type == 'bullish' and recent_candle['close'] <= recent_candle['open']:
                         continue
@@ -309,7 +327,7 @@ async def main():
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    # Start Flask web server in background thread
+    # Start Flask web server in background
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
