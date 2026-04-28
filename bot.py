@@ -12,6 +12,7 @@ import logging
 from collections import deque
 import time
 from uuid import uuid4
+import difflib
 
 load_dotenv()
 
@@ -20,8 +21,8 @@ with open('config.json', 'r') as f:
     config = json.load(f)
 
 RISK_PERCENT = config.get("risk_percent", 1.0)
-LEVERAGE = config.get("leverage", 5)
-SYMBOLS = config.get("symbols", ["PI_XBTUSD"])
+LEVERAGE = config.get("leverage", 1)
+SYMBOLS = config.get("symbols", ["BTC/USD"])
 TIMEFRAME = config.get("timeframe", "1m")
 WARMUP_MINUTES = config.get("warmup_minutes", 0)
 MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 9)
@@ -34,8 +35,16 @@ try:
 except (TypeError, ValueError):
     DRY_RUN_STARTING_WALLET_USD = 100.0
 PRECHECK_DISABLE_AFTER = int(config.get("precheck_disable_after", 3))
+try:
+    SIMULATED_FEE_BPS = float(config.get("simulated_fee_bps", 26.0))
+except (TypeError, ValueError):
+    SIMULATED_FEE_BPS = 26.0
+try:
+    SIMULATED_SLIPPAGE_BPS = float(config.get("simulated_slippage_bps", 5.0))
+except (TypeError, ValueError):
+    SIMULATED_SLIPPAGE_BPS = 5.0
 
-exchange = ccxt.krakenfutures({
+exchange = ccxt.kraken({
     'apiKey': os.getenv('KRAKEN_API_KEY'),
     'secret': os.getenv('KRAKEN_API_SECRET'),
     'enableRateLimit': True,
@@ -101,7 +110,68 @@ def load_markets_robust():
     log("⚠️ Could not load markets from Kraken. Continuing with safe defaults...", to_file=False)
     return {}
 
-load_markets_robust()
+def resolve_configured_symbols(configured_symbols, markets):
+    if not configured_symbols:
+        return []
+    if not markets:
+        log("⚠️ Market cache is empty; symbol validation skipped.", to_file=True)
+        return configured_symbols
+
+    symbol_keys = set(markets.keys())
+    id_to_symbol = {}
+    for symbol_key, market in markets.items():
+        market_id = (market or {}).get("id")
+        if market_id:
+            id_to_symbol[str(market_id).upper()] = symbol_key
+
+    resolved = []
+    for raw_symbol in configured_symbols:
+        candidate = str(raw_symbol).strip()
+        if not candidate:
+            continue
+        if candidate in symbol_keys:
+            resolved.append(candidate)
+            continue
+        by_id = id_to_symbol.get(candidate.upper())
+        if by_id:
+            resolved.append(by_id)
+            log(f"ℹ️ Symbol '{candidate}' resolved via market id -> '{by_id}'", to_file=True)
+            continue
+
+        # Help with common separator mistakes, e.g. spaces vs underscores.
+        compact = candidate.replace(" ", "")
+        normalized = candidate.replace(" ", "_")
+        by_compact = id_to_symbol.get(compact.upper()) or id_to_symbol.get(normalized.upper())
+        if by_compact:
+            resolved.append(by_compact)
+            log(f"ℹ️ Symbol '{candidate}' normalized -> '{by_compact}'", to_file=True)
+            continue
+
+        universe = list(symbol_keys) + list(id_to_symbol.keys())
+        suggestions = difflib.get_close_matches(candidate.upper(), [u.upper() for u in universe], n=3, cutoff=0.45)
+        if suggestions:
+            log(
+                f"❌ Unsupported Kraken spot symbol '{candidate}'. Closest matches: {', '.join(suggestions)}",
+                to_file=True
+            )
+        else:
+            log(
+                f"❌ Unsupported Kraken spot symbol '{candidate}'. Use Kraken spot symbols like BTC/USD, ETH/USD.",
+                to_file=True
+            )
+
+    deduped = []
+    seen = set()
+    for sym in resolved:
+        if sym not in seen:
+            deduped.append(sym)
+            seen.add(sym)
+    return deduped
+
+MARKETS_CACHE = load_markets_robust()
+SYMBOLS = resolve_configured_symbols(SYMBOLS, MARKETS_CACHE)
+if not SYMBOLS:
+    log("🚫 No valid Kraken spot symbols configured after validation. Bot will idle until symbols are fixed.", to_file=True)
 
 # ====================== FLASK LIVE VIEWER ======================
 app = Flask(__name__)
@@ -329,6 +399,15 @@ def _floor_to_step(value, step):
     units = int(value / step)
     return max(units * step, 0.0)
 
+def _apply_slippage(price, side, slippage_bps):
+    factor = slippage_bps / 10000.0
+    if side == 'buy':
+        return price * (1.0 + factor)
+    return price * (1.0 - factor)
+
+def _estimate_fee(amount_quote, fee_bps):
+    return max(amount_quote, 0.0) * (max(fee_bps, 0.0) / 10000.0)
+
 def _estimate_stop_loss_usd(market, contracts, entry_price, stop_price):
     contracts = _safe_float(contracts, 0.0)
     entry_price = _safe_float(entry_price, 0.0)
@@ -374,8 +453,8 @@ def precheck_symbol_tradeability(symbol, current_price, stop_price, risk_usd):
             step = 1.0
     min_qty = max(min_amount, step)
     available_usd = _safe_float(live_balance.get("available_usd"), 0.0)
-    min_lot_risk = _estimate_stop_loss_usd(market, min_qty, current_price, stop_price)
-    min_lot_margin = _estimate_initial_margin_usd(market, min_qty, current_price, LEVERAGE)
+    min_lot_risk = abs(current_price - stop_price) * min_qty
+    min_lot_cost = current_price * min_qty
 
     if available_usd <= 0:
         return {
@@ -383,15 +462,15 @@ def precheck_symbol_tradeability(symbol, current_price, stop_price, risk_usd):
             "reason": "NO_AVAILABLE_BALANCE",
             "available_usd": available_usd,
             "min_lot_risk": min_lot_risk,
-            "min_lot_margin": min_lot_margin,
+            "min_lot_cost": min_lot_cost,
         }
-    if min_lot_margin > available_usd:
+    if min_lot_cost > available_usd:
         return {
             "ok": False,
-            "reason": "MIN_LOT_MARGIN_EXCEEDS_AVAILABLE",
+            "reason": "MIN_LOT_COST_EXCEEDS_AVAILABLE",
             "available_usd": available_usd,
             "min_lot_risk": min_lot_risk,
-            "min_lot_margin": min_lot_margin,
+            "min_lot_cost": min_lot_cost,
         }
     if min_lot_risk > risk_usd:
         return {
@@ -399,14 +478,14 @@ def precheck_symbol_tradeability(symbol, current_price, stop_price, risk_usd):
             "reason": "MIN_LOT_RISK_EXCEEDS_TARGET",
             "available_usd": available_usd,
             "min_lot_risk": min_lot_risk,
-            "min_lot_margin": min_lot_margin,
+            "min_lot_cost": min_lot_cost,
         }
     return {
         "ok": True,
         "reason": "OK",
         "available_usd": available_usd,
         "min_lot_risk": min_lot_risk,
-        "min_lot_margin": min_lot_margin,
+        "min_lot_cost": min_lot_cost,
     }
 
 def refresh_live_balance():
@@ -429,22 +508,16 @@ def refresh_live_balance():
     try:
         balance = exchange.fetch_balance()
         usd_bucket = balance.get('USD', {}) or {}
-        info = balance.get('info', {}) or {}
         wallet = (
             _safe_float(usd_bucket.get('total'), 0.0)
-            or _safe_float(info.get('accountValue'), 0.0)
-            or _safe_float(info.get('balanceValue'), 0.0)
         )
         available = (
             _safe_float(usd_bucket.get('free'), 0.0)
-            or _safe_float(info.get('marginAvailable'), 0.0)
-            or _safe_float(info.get('availableFunds'), 0.0)
         )
         used = _safe_float(usd_bucket.get('used'), 0.0) or max(wallet - available, 0.0)
-        equity = _safe_float(info.get('accountValue'), 0.0) or wallet
         live_balance.update({
             "wallet_usd": max(wallet, 0.0),
-            "equity_usd": max(equity, 0.0),
+            "equity_usd": max(wallet, 0.0),
             "available_usd": max(available, 0.0),
             "used_usd": max(used, 0.0),
             "fetched_at": datetime.now().strftime("%H:%M:%S"),
@@ -512,6 +585,9 @@ async def fetch_latest_candles(symbol, tf, limit=500):
 async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd, score, choch_level, fvg_extreme):
     log(f"=== ATTEMPTING ORDER === [{symbol}] {side.upper()} | Score: {score:.1f} | CHOCH Level: {choch_level:.4f}", to_file=True)
     try:
+        if side != 'buy':
+            log(f"⚠️ [{symbol}] Spot mode only supports long entries; skipping non-buy signal", to_file=True)
+            return None
         m = exchange.market(symbol)
         distance = abs(current_price - stop_price)
         if distance <= 0:
@@ -532,90 +608,82 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             log(f"⚠️ [{symbol}] No available balance; skipping order", to_file=True)
             return None
 
-        per_contract_risk = _estimate_stop_loss_usd(m, 1.0, current_price, stop_price)
-        if per_contract_risk <= 0:
-            log(f"⚠️ [{symbol}] Invalid per-contract stop risk; skipping order", to_file=True)
-            return None
-
-        raw_quantity = max(risk_usd / per_contract_risk, 0.0)
+        per_unit_risk = distance
+        raw_quantity = max(risk_usd / per_unit_risk, 0.0)
         quantity = _floor_to_step(raw_quantity, step)
         if quantity < min_amount:
             log(
                 f"⚠️ [{symbol}] Risk target too small for min size. "
-                f"risk=${risk_usd:.5f}, per_contract_risk=${per_contract_risk:.5f}, min_amount={min_amount}",
+                f"risk=${risk_usd:.5f}, per_unit_risk=${per_unit_risk:.5f}, min_amount={min_amount}",
                 to_file=True
             )
             return None
 
-        max_by_cap = _floor_to_step(2000.0, step)
-        if m.get('linear'):
-            contract_size = _safe_float(m.get('contractSize'), 1.0) or 1.0
-            max_by_margin = _floor_to_step((available_usd * LEVERAGE) / max(current_price * contract_size, 1e-8), step)
-        elif m.get('inverse'):
-            contract_size = _safe_float(m.get('contractSize'), 1.0) or 1.0
-            max_by_margin = _floor_to_step((available_usd * LEVERAGE) / max(contract_size, 1e-8), step)
-        else:
-            max_by_margin = _floor_to_step((available_usd * LEVERAGE) / max(current_price, 1e-8), step)
-        if max_by_margin <= 0:
-            log(f"⚠️ [{symbol}] Available balance too low after leverage check; skipping", to_file=True)
+        max_by_cash = _floor_to_step(available_usd / max(current_price, 1e-8), step)
+        if max_by_cash <= 0:
+            log(f"⚠️ [{symbol}] Available balance too low for spot entry", to_file=True)
             return None
-        quantity = min(quantity, max_by_margin, max_by_cap)
+        quantity = min(quantity, max_by_cash)
 
-        est_risk = _estimate_stop_loss_usd(m, quantity, current_price, stop_price)
+        est_risk = distance * quantity
         while quantity >= min_amount and est_risk > (risk_usd * 1.001):
             quantity = _floor_to_step(quantity - step, step)
-            est_risk = _estimate_stop_loss_usd(m, quantity, current_price, stop_price)
+            est_risk = distance * quantity
 
         if quantity < min_amount:
             log(
                 f"⚠️ [{symbol}] Could not fit min lot within risk target. "
-                f"Target=${risk_usd:.5f}, min_lot_risk=${_estimate_stop_loss_usd(m, min_amount, current_price, stop_price):.5f}",
+                f"Target=${risk_usd:.5f}, min_lot_risk=${(distance * min_amount):.5f}",
                 to_file=True
             )
             return None
 
-        required_margin = _estimate_initial_margin_usd(m, quantity, current_price, LEVERAGE)
-        if required_margin > available_usd:
+        required_cash = current_price * quantity
+        if required_cash > available_usd:
             log(
-                f"⚠️ [{symbol}] Required margin too high. Need~${required_margin:.5f}, available=${available_usd:.5f}",
+                f"⚠️ [{symbol}] Required cash too high. Need~${required_cash:.5f}, available=${available_usd:.5f}",
                 to_file=True
             )
             return None
         log(
             f"📐 [{symbol}] Sized order | qty={quantity} | target_risk=${risk_usd:.5f} | est_risk=${est_risk:.5f} "
-            f"| req_margin~${required_margin:.5f} | avail=${available_usd:.5f}",
+            f"| req_cash~${required_cash:.5f} | avail=${available_usd:.5f}",
             to_file=True
         )
 
-        limit_price = current_price * (1.002 if side == 'buy' else 0.998)
-        opposite = 'sell' if side == 'buy' else 'buy'
+        opposite = 'sell'
 
         if DRY_RUN_MODE:
             trade_id = str(uuid4())
+            entry_fill_price = _apply_slippage(current_price, 'buy', SIMULATED_SLIPPAGE_BPS)
+            entry_notional = entry_fill_price * quantity
+            entry_fee = _estimate_fee(entry_notional, SIMULATED_FEE_BPS)
             dry_run_payload = {
                 "trade_id": trade_id,
                 "symbol": symbol,
                 "side": side,
-                "entry_type": "limit",
-                "entry_price": float(limit_price),
+                "entry_type": "simulated_market",
+                "entry_price": float(entry_fill_price),
                 "entry_reference_price": float(current_price),
                 "quantity": float(quantity),
-                "leverage": int(LEVERAGE),
                 "stop_price": float(stop_price),
                 "stop_side": opposite,
                 "take_profit_price": float(tp_price),
                 "take_profit_side": opposite,
                 "risk_usd_target": float(risk_usd),
                 "estimated_stop_loss_usd": float(est_risk),
-                "required_margin_estimate_usd": float(required_margin),
+                "required_cash_estimate_usd": float(required_cash),
                 "available_usd_at_signal": float(available_usd),
+                "simulated_fee_bps": float(SIMULATED_FEE_BPS),
+                "simulated_slippage_bps": float(SIMULATED_SLIPPAGE_BPS),
+                "entry_fee_usd": float(entry_fee),
                 "score": float(score),
                 "choch_level": float(choch_level),
                 "fvg_extreme": float(fvg_extreme),
             }
             log(
                 f"🧪 DRY RUN | WOULD CREATE ORDER [{symbol}] {side.upper()} "
-                f"| qty={quantity} | limit={limit_price:.4f} | SL={stop_price:.4f} | TP={tp_price:.4f} | lev={LEVERAGE}x",
+                f"| qty={quantity} | entry~{entry_fill_price:.4f} | SL={stop_price:.4f} | TP={tp_price:.4f}",
                 to_file=True
             )
 
@@ -633,82 +701,39 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
                 'entry_order_id': f"dryrun-entry-{uuid4()}",
                 'sl_order_id': f"dryrun-sl-{uuid4()}",
                 'tp_order_id': f"dryrun-tp-{uuid4()}",
-                'entry_fill_price': float(current_price),
+                'entry_fill_price': float(entry_fill_price),
                 'entry_filled': float(quantity),
                 'simulated': True,
-                'required_margin_estimate_usd': float(required_margin),
+                'required_margin_estimate_usd': float(required_cash),
+                'entry_fee_usd': float(entry_fee),
             }
             log_trade_audit("dry_run_trade_signal", dry_run_payload)
             return {"id": f"dryrun-{uuid4()}", "dry_run": True, "info": dry_run_payload}
 
-        # Conservative adjustment to avoid insufficientAvailableFunds
-        try:
-            exchange.set_leverage(LEVERAGE, symbol)
-        except Exception as e:
-            log(f"⚠️ [{symbol}] set_leverage failed ({LEVERAGE}x): {e}", to_file=True)
-
-        order = exchange.create_order(symbol=symbol, type='limit', side=side, amount=quantity, price=limit_price, params={'leverage': LEVERAGE})
+        order = exchange.create_order(symbol=symbol, type='market', side='buy', amount=quantity)
         log(f"✅ ENTRY ORDER CREATED | ID: {order.get('id')}", to_file=True)
 
-        # ROBUST POSITION CONFIRMATION (polling)
-        confirmed = False
-        for attempt in range(8):  # up to ~10 seconds
-            await asyncio.sleep(1.25)
-            positions = exchange.fetch_positions()
-            if any(p['symbol'] == symbol and float(p.get('contracts', 0)) != 0 for p in positions):
-                confirmed = True
-                break
-        if not confirmed:
-            log("⚠️ Position not confirmed after retries - checking order status...", to_file=True)
-            try:
-                fetched = exchange.fetch_order(order.get('id'), symbol)
-                status = (fetched or {}).get('status')
-                if status == 'closed':
-                    log("✅ Entry order closed on exchange", to_file=True)
-                    confirmed = True
-            except:
-                pass
-
-        if not confirmed:
-            log("❌ Position not confirmed after all retries", to_file=True)
-            return None
-
-        log("✅ REAL POSITION CONFIRMED", to_file=True)
-
-        sl_order = exchange.create_order(
-            symbol=symbol,
-            type='market',
-            side=opposite,
-            amount=quantity,
-            params={'stopLossPrice': stop_price, 'reduceOnly': True, 'triggerSignal': 'mark'}
-        )
-        log(f"✅ SL placed @ {stop_price:.4f} (reduceOnly, mark trigger)", to_file=True)
-        tp_order = exchange.create_order(
-            symbol=symbol,
-            type='market',
-            side=opposite,
-            amount=quantity,
-            params={'takeProfitPrice': tp_price, 'reduceOnly': True, 'triggerSignal': 'mark'}
-        )
-        log(f"✅ TP placed @ {tp_price:.4f} ({RR_RATIO:.1f}R, reduceOnly, mark trigger)", to_file=True)
-
         trade_id = str(uuid4())
+        entry_fill_price = _safe_float(order.get('average'), float(current_price))
+        entry_filled_qty = _safe_float(order.get('filled'), float(quantity))
+        entry_fee = _estimate_fee(entry_fill_price * entry_filled_qty, SIMULATED_FEE_BPS)
         active_trades[symbol] = {
             'trade_id': trade_id,
-            'side': side,
+            'side': 'buy',
             'entry_price': float(current_price),
             'stop_price': float(stop_price),
             'tp_price': float(tp_price),
-            'quantity': float(quantity),
+            'quantity': float(entry_filled_qty),
             'open_time': datetime.now(),
             'choch_level': float(choch_level),
             'fvg_extreme': float(fvg_extreme),
             'breakeven_moved': False,
             'entry_order_id': order.get('id'),
-            'sl_order_id': sl_order.get('id'),
-            'tp_order_id': tp_order.get('id'),
-            'entry_fill_price': _safe_float(order.get('average'), float(current_price)),
-            'entry_filled': _safe_float(order.get('filled'), float(quantity))
+            'sl_order_id': None,
+            'tp_order_id': None,
+            'entry_fill_price': float(entry_fill_price),
+            'entry_filled': float(entry_filled_qty),
+            'entry_fee_usd': float(entry_fee),
         }
         log_trade_audit("trade_opened", {
             "trade_id": trade_id,
@@ -716,22 +741,22 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             "side": side,
             "score": float(score),
             "entry_price": float(current_price),
-            "entry_fill_price": _safe_float(order.get('average'), float(current_price)),
+            "entry_fill_price": float(entry_fill_price),
             "stop_price": float(stop_price),
             "tp_price": float(tp_price),
-            "quantity": float(quantity),
+            "quantity": float(entry_filled_qty),
             "risk_usd": float(risk_usd),
             "estimated_stop_loss_usd": float(est_risk),
-            "required_margin_estimate_usd": float(required_margin),
+            "required_cash_estimate_usd": float(required_cash),
             "available_usd_at_entry": float(available_usd),
-            "leverage": int(LEVERAGE),
+            "entry_fee_usd": float(entry_fee),
             "order_ids": {
                 "entry_order_id": order.get('id'),
-                "sl_order_id": sl_order.get('id'),
-                "tp_order_id": tp_order.get('id'),
+                "sl_order_id": None,
+                "tp_order_id": None,
             },
         })
-        log(f"=== POSITION OPENED SUCCESSFULLY (1m CHOCH+FVG) ===", to_file=True)
+        log(f"=== SPOT POSITION OPENED SUCCESSFULLY (1m CHOCH+FVG) ===", to_file=True)
         return order
     except Exception as e:
         if "insufficientAvailableFunds" in str(e):
@@ -772,20 +797,7 @@ async def manage_open_trade(symbol, df):
                 new_sl = trade['entry_price']
                 trade['stop_price'] = new_sl
                 trade['breakeven_moved'] = True
-                if trade.get('simulated'):
-                    trade['sl_order_id'] = f"dryrun-sl-be-{uuid4()}"
-                else:
-                    side_for_sl = 'sell' if trade['side'] == 'buy' else 'buy'
-                    if trade.get('sl_order_id'):
-                        exchange.cancel_order(trade.get('sl_order_id'), symbol)
-                    be_sl_order = exchange.create_order(
-                        symbol=symbol,
-                        type='market',
-                        side=side_for_sl,
-                        amount=trade['quantity'],
-                        params={'stopLossPrice': new_sl, 'reduceOnly': True, 'triggerSignal': 'mark'}
-                    )
-                    trade['sl_order_id'] = (be_sl_order or {}).get('id')
+                trade['sl_order_id'] = f"{'dryrun' if trade.get('simulated') else 'live'}-sl-be-{uuid4()}"
                 log_trade_audit("breakeven_moved", {
                     "trade_id": trade.get('trade_id'),
                     "symbol": symbol,
@@ -797,115 +809,83 @@ async def manage_open_trade(symbol, df):
             except Exception as e:
                 log(f"⚠️ Breakeven failed: {e}", to_file=True)
 
+    close_reason = None
+    trigger_price = None
+    if latest_low <= trade['stop_price']:
+        close_reason = "SL_HIT_SIMULATED" if trade.get('simulated') else "SL_HIT"
+        trigger_price = _safe_float(trade['stop_price'], 0.0)
+    elif latest_high >= trade['tp_price']:
+        close_reason = "TP_HIT_SIMULATED" if trade.get('simulated') else "TP_HIT"
+        trigger_price = _safe_float(trade['tp_price'], 0.0)
+
+    if not close_reason or trigger_price <= 0:
+        return
+
+    exit_qty = _safe_float(trade.get('quantity'), 0.0)
+    if exit_qty <= 0:
+        return
+
     if trade.get('simulated'):
-        has_position = True
-        close_reason = None
-        exit_price = None
-
-        if trade['side'] == 'buy':
-            if latest_low <= trade['stop_price']:
-                close_reason = "SL_HIT_SIMULATED"
-                exit_price = _safe_float(trade['stop_price'], 0.0)
-            elif latest_high >= trade['tp_price']:
-                close_reason = "TP_HIT_SIMULATED"
-                exit_price = _safe_float(trade['tp_price'], 0.0)
-        else:
-            if latest_high >= trade['stop_price']:
-                close_reason = "SL_HIT_SIMULATED"
-                exit_price = _safe_float(trade['stop_price'], 0.0)
-            elif latest_low <= trade['tp_price']:
-                close_reason = "TP_HIT_SIMULATED"
-                exit_price = _safe_float(trade['tp_price'], 0.0)
-
-        if close_reason and exit_price and exit_price > 0:
-            pnl = _compute_simulated_pnl(trade, exit_price)
-            fee_total = 0.0
-            simulated_wallet_usd = max(simulated_wallet_usd + pnl - fee_total, 0.0)
-            refresh_live_balance()
-            daily_pnl += pnl
-            total_pnl += pnl
-            if pnl >= 0:
-                total_wins += 1
-                total_win_usd += abs(pnl)
-                result = "WIN"
-            else:
-                total_losses += 1
-                total_loss_usd += abs(pnl)
-                result = "LOSS"
-            log_trade_audit("trade_closed", {
-                "trade_id": trade.get('trade_id'),
-                "symbol": symbol,
-                "side": trade.get('side'),
-                "result": result,
-                "close_reason": close_reason,
-                "entry_price": _safe_float(trade.get('entry_fill_price') or trade.get('entry_price')),
-                "exit_price": float(exit_price),
-                "quantity": _safe_float(trade.get('quantity')),
-                "fees_usd": float(fee_total),
-                "realized_pnl_usd": float(pnl),
-                "order_ids": {
-                    "entry_order_id": trade.get('entry_order_id'),
-                    "sl_order_id": trade.get('sl_order_id'),
-                    "tp_order_id": trade.get('tp_order_id'),
-                },
-                "duration_seconds": max((datetime.now() - trade.get('open_time', datetime.now())).total_seconds(), 0.0),
-                "simulated": True,
-            })
-            del active_trades[symbol]
-            log(
-                f"   🧪 [{symbol}] {trade['side'].upper()} {result} CLOSED ({close_reason}) | Exit @{exit_price:.4f} | PnL ${pnl:.4f}",
-                to_file=True
-            )
-            has_position = False
+        exit_price = _apply_slippage(trigger_price, 'sell', SIMULATED_SLIPPAGE_BPS)
+        exit_fee = _estimate_fee(exit_price * exit_qty, SIMULATED_FEE_BPS)
+        entry_price = _safe_float(trade.get('entry_fill_price') or trade.get('entry_price'))
+        entry_fee = _safe_float(trade.get('entry_fee_usd'), 0.0)
+        pnl = ((exit_price - entry_price) * exit_qty) - entry_fee - exit_fee
+        fee_total = entry_fee + exit_fee
+        simulated_wallet_usd = max(simulated_wallet_usd + pnl, 0.0)
+        refresh_live_balance()
     else:
         try:
-            positions = exchange.fetch_positions([symbol])
-            has_position = any(
-                p.get('symbol') == symbol and abs(float(p.get('contracts', 0) or 0)) > 0
-                for p in positions
-            )
+            exit_order = exchange.create_order(symbol=symbol, type='market', side='sell', amount=exit_qty)
         except Exception as e:
-            log(f"⚠️ Could not fetch positions for reconciliation ({symbol}): {e}", to_file=True)
+            log(f"⚠️ [{symbol}] Exit order failed ({close_reason}): {e}", to_file=True)
             return
+        exit_price = _safe_float(exit_order.get('average'), trigger_price)
+        filled_qty = _safe_float(exit_order.get('filled'), exit_qty) or exit_qty
+        entry_price = _safe_float(trade.get('entry_fill_price') or trade.get('entry_price'))
+        entry_fee = _safe_float(trade.get('entry_fee_usd'), 0.0)
+        exit_fee = _extract_fee_cost(exit_order)
+        if exit_fee == 0:
+            exit_fee = _estimate_fee(exit_price * filled_qty, SIMULATED_FEE_BPS)
+        fee_total = entry_fee + exit_fee
+        pnl = ((exit_price - entry_price) * filled_qty) - fee_total
+        trade['tp_order_id'] = exit_order.get('id')
 
-    if not has_position:
-        if trade.get('simulated'):
-            return
-        close_reason, exit_price = _determine_close_reason_and_price(symbol, trade)
-        pnl, fee_total = _compute_realized_pnl(symbol, trade, exit_price)
-        daily_pnl += pnl
-        total_pnl += pnl
-        if pnl >= 0:
-            total_wins += 1
-            total_win_usd += abs(pnl)
-            result = "WIN"
-        else:
-            total_losses += 1
-            total_loss_usd += abs(pnl)
-            result = "LOSS"
-        log_trade_audit("trade_closed", {
-            "trade_id": trade.get('trade_id'),
-            "symbol": symbol,
-            "side": trade.get('side'),
-            "result": result,
-            "close_reason": close_reason,
-            "entry_price": _safe_float(trade.get('entry_fill_price') or trade.get('entry_price')),
-            "exit_price": float(exit_price),
-            "quantity": _safe_float(trade.get('quantity')),
-            "fees_usd": float(fee_total),
-            "realized_pnl_usd": float(pnl),
-            "order_ids": {
-                "entry_order_id": trade.get('entry_order_id'),
-                "sl_order_id": trade.get('sl_order_id'),
-                "tp_order_id": trade.get('tp_order_id'),
-            },
-            "duration_seconds": max((datetime.now() - trade.get('open_time', datetime.now())).total_seconds(), 0.0),
-        })
-        del active_trades[symbol]
-        log(
-            f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED ({close_reason}) | Exit @{exit_price:.4f} | Fees ${fee_total:.4f} | PnL ${pnl:.4f}",
-            to_file=True
-        )
+    daily_pnl += pnl
+    total_pnl += pnl
+    if pnl >= 0:
+        total_wins += 1
+        total_win_usd += abs(pnl)
+        result = "WIN"
+    else:
+        total_losses += 1
+        total_loss_usd += abs(pnl)
+        result = "LOSS"
+    log_trade_audit("trade_closed", {
+        "trade_id": trade.get('trade_id'),
+        "symbol": symbol,
+        "side": trade.get('side'),
+        "result": result,
+        "close_reason": close_reason,
+        "entry_price": _safe_float(trade.get('entry_fill_price') or trade.get('entry_price')),
+        "exit_price": float(exit_price),
+        "quantity": _safe_float(trade.get('quantity')),
+        "fees_usd": float(fee_total),
+        "realized_pnl_usd": float(pnl),
+        "order_ids": {
+            "entry_order_id": trade.get('entry_order_id'),
+            "sl_order_id": trade.get('sl_order_id'),
+            "tp_order_id": trade.get('tp_order_id'),
+        },
+        "duration_seconds": max((datetime.now() - trade.get('open_time', datetime.now())).total_seconds(), 0.0),
+        "simulated": bool(trade.get('simulated')),
+    })
+    del active_trades[symbol]
+    log_prefix = "🧪" if trade.get('simulated') else "✅"
+    log(
+        f"   {log_prefix} [{symbol}] {trade['side'].upper()} {result} CLOSED ({close_reason}) | Exit @{exit_price:.4f} | Fees ${fee_total:.4f} | PnL ${pnl:.4f}",
+        to_file=True
+    )
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, audit_file, last_trade_time, RISK_USD, latest_diagnostics
@@ -926,7 +906,7 @@ async def main():
             account_balance = _safe_float(balance_snapshot.get("available_usd"), 0.0)
             RISK_USD = account_balance * (RISK_PERCENT / 100.0)
             if RISK_USD <= 0:
-                log("⚠️ No available USD margin yet; waiting...", to_file=False, to_recent=False)
+                log("⚠️ No available USD balance yet; waiting...", to_file=False, to_recent=False)
                 await asyncio.sleep(20)
                 continue
             log(
@@ -1046,7 +1026,7 @@ async def main():
                         log(
                             f"🧪 Precheck fail [{s['symbol']}] {precheck.get('reason')} "
                             f"| min_lot_risk=${precheck.get('min_lot_risk', 0.0):.5f} "
-                            f"| min_lot_margin=${precheck.get('min_lot_margin', 0.0):.5f} "
+                            f"| min_lot_cost=${precheck.get('min_lot_cost', 0.0):.5f} "
                             f"| available=${precheck.get('available_usd', 0.0):.5f} "
                             f"| fail_count={fail_count}/{PRECHECK_DISABLE_AFTER}",
                             to_file=True
@@ -1055,26 +1035,7 @@ async def main():
                             disabled_symbols[s['symbol']] = precheck.get('reason')
                             log(f"🚫 Disabling {s['symbol']} from tracking (precheck failures: {precheck.get('reason')})", to_file=True)
                 else:
-                    stop_price = s['fvg_extreme'] + buffer
-                    tp_price = s['current_price'] - (stop_price - s['current_price']) * RR_RATIO
-                    precheck = precheck_symbol_tradeability(s['symbol'], s['current_price'], stop_price, RISK_USD)
-                    if precheck.get("ok"):
-                        symbol_precheck_failures.pop(s['symbol'], None)
-                        created_order = await place_trade(s['symbol'], 'sell', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
-                    else:
-                        fail_count = symbol_precheck_failures.get(s['symbol'], 0) + 1
-                        symbol_precheck_failures[s['symbol']] = fail_count
-                        log(
-                            f"🧪 Precheck fail [{s['symbol']}] {precheck.get('reason')} "
-                            f"| min_lot_risk=${precheck.get('min_lot_risk', 0.0):.5f} "
-                            f"| min_lot_margin=${precheck.get('min_lot_margin', 0.0):.5f} "
-                            f"| available=${precheck.get('available_usd', 0.0):.5f} "
-                            f"| fail_count={fail_count}/{PRECHECK_DISABLE_AFTER}",
-                            to_file=True
-                        )
-                        if fail_count >= PRECHECK_DISABLE_AFTER:
-                            disabled_symbols[s['symbol']] = precheck.get('reason')
-                            log(f"🚫 Disabling {s['symbol']} from tracking (precheck failures: {precheck.get('reason')})", to_file=True)
+                    log(f"ℹ️ [{s['symbol']}] Bearish setup ignored in spot mode (long-only)", to_file=False, to_recent=False)
                 if created_order:
                     daily_trades += 1
                     last_trade_time = datetime.now()
