@@ -172,7 +172,6 @@ def detect_swing_highs_lows(df, strength=5):
     return df
 
 def detect_choch(df):
-    """Exact CHOCH pattern you described: series of lower highs (bullish) / higher lows (bearish) until decisive new spike"""
     df = detect_swing_highs_lows(df)
     signals = []
     for i in range(40, len(df)):
@@ -180,29 +179,26 @@ def detect_choch(df):
         recent_lows = df['swing_low'].iloc[i-40:i].dropna()
         if len(recent_highs) < 3 or len(recent_lows) < 3:
             continue
-        # Bullish CHOCH - decisive break of most recent swing high
+        # Bullish CHOCH
         if (df['close'].iloc[i] > recent_highs.iloc[-1] and df['close'].iloc[i-1] <= recent_highs.iloc[-1] and
             recent_highs.iloc[-1] > recent_highs.iloc[-2]):
             signals.append(('bullish', i, recent_highs.iloc[-1]))
-        # Bearish CHOCH - decisive break of most recent swing low
+        # Bearish CHOCH
         if (df['close'].iloc[i] < recent_lows.iloc[-1] and df['close'].iloc[i-1] >= recent_lows.iloc[-1] and
             recent_lows.iloc[-1] < recent_lows.iloc[-2]):
             signals.append(('bearish', i, recent_lows.iloc[-1]))
     return signals
 
 def detect_fvg(df):
-    """Strict 3-candle FVG: three consecutive candles same direction + no wick overlap between first and third"""
     fvgs = []
     for i in range(3, len(df)):
         c1, c2, c3 = df.iloc[i-3:i]
-        # Bullish FVG
-        if (c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and
-            c1['high'] < c3['low']):
+        # Bullish FVG - three green candles + no wick overlap
+        if (c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and c1['high'] < c3['low']):
             midpoint = (c1['high'] + c3['low']) / 2
-            fvgs.append(('bullish', midpoint, c3['low'], i, c1['high'], c3['low'], i-1))  # fvg_candle_idx = i-1
-        # Bearish FVG
-        if (c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and
-            c1['low'] > c3['high']):
+            fvgs.append(('bullish', midpoint, c3['low'], i, c1['high'], c3['low'], i-1))
+        # Bearish FVG - three red candles + no wick overlap
+        if (c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and c1['low'] > c3['high']):
             midpoint = (c1['low'] + c3['high']) / 2
             fvgs.append(('bearish', midpoint, c3['high'], i, c1['low'], c3['high'], i-1))
     return fvgs
@@ -323,7 +319,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Kraken ICT Bot Started - EXACT CHOCH + FVG logic you described (1m only)", to_file=True)
+    log("🚀 Kraken ICT Bot Started - EXACT CHOCH + FVG logic (unpack error fixed)", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
@@ -358,10 +354,6 @@ async def main():
                 in_warmup = False
 
             best_setup = None
-            best_score = -999
-            best_choch_level = None
-            best_fvg_extreme = None
-            best_fvg_candle_high_low = None
 
             for symbol in SYMBOLS:
                 df1m = await fetch_latest_candles(symbol, TIMEFRAME)
@@ -374,7 +366,12 @@ async def main():
                 latest_choch_idx = choch_1m[-1][1] if choch_1m else -1
 
                 for fvg in fvg_1m[-20:]:
-                    fvg_type, midpoint, fvg_extreme, fvg_idx, _, _, fvg_candle_idx = fvg
+                    fvg_type = fvg[0]
+                    midpoint = fvg[1]
+                    fvg_extreme = fvg[2]
+                    fvg_idx = fvg[3]
+                    fvg_candle_idx = fvg[6]
+
                     if latest_choch_idx != -1 and fvg_idx < latest_choch_idx:
                         continue
 
@@ -388,26 +385,30 @@ async def main():
                         continue
 
                     score = 90.0
-                    if score > best_score:
-                        best_score = score
-                        best_setup = (symbol, fvg_type, current_price, fvg_extreme, fvg_candle_idx)
-                        best_choch_level = choch_1m[-1][2] if choch_1m else current_price
-                        best_fvg_extreme = fvg_extreme
-                        best_fvg_candle_high_low = df1m['high'].iloc[fvg_candle_idx] if fvg_type == 'bullish' else df1m['low'].iloc[fvg_candle_idx]
+                    if best_setup is None or score > best_setup.get('score', 0):
+                        best_setup = {
+                            'symbol': symbol,
+                            'direction': fvg_type,
+                            'current_price': current_price,
+                            'fvg_extreme': fvg_extreme,
+                            'fvg_candle_idx': fvg_candle_idx,
+                            'score': score,
+                            'choch_level': choch_1m[-1][2] if choch_1m else current_price
+                        }
 
-            await manage_open_trade(symbol, df1m)  # manage any open trade first
+                await manage_open_trade(symbol, df1m)
 
             if best_setup and daily_trades < MAX_TRADES_PER_DAY:
-                symbol, direction, current_price, fvg_extreme, fvg_candle_idx = best_setup
-                buffer = 0.0005 * current_price
-                if direction == 'bullish':
-                    stop_price = fvg_extreme - buffer
-                    tp_price = current_price + (current_price - stop_price) * RR_RATIO
-                    await place_trade(symbol, 'buy', current_price, stop_price, tp_price, RISK_USD, best_score, best_choch_level, best_fvg_candle_high_low)
+                s = best_setup
+                buffer = 0.0005 * s['current_price']
+                if s['direction'] == 'bullish':
+                    stop_price = s['fvg_extreme'] - buffer
+                    tp_price = s['current_price'] + (s['current_price'] - stop_price) * RR_RATIO
+                    await place_trade(s['symbol'], 'buy', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
                 else:
-                    stop_price = fvg_extreme + buffer
-                    tp_price = current_price - (stop_price - current_price) * RR_RATIO
-                    await place_trade(symbol, 'sell', current_price, stop_price, tp_price, RISK_USD, best_score, best_choch_level, best_fvg_candle_high_low)
+                    stop_price = s['fvg_extreme'] + buffer
+                    tp_price = s['current_price'] - (stop_price - s['current_price']) * RR_RATIO
+                    await place_trade(s['symbol'], 'sell', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
                 daily_trades += 1
                 last_trade_time = datetime.now()
 
