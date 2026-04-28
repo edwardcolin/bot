@@ -18,7 +18,7 @@ load_dotenv()
 with open('config.json', 'r') as f:
     config = json.load(f)
 
-RISK_USD = config.get("risk_usd", 1.0)
+RISK_PERCENT = config.get("risk_percent", 1.0)
 LEVERAGE = config.get("leverage", 5)
 SYMBOLS = config.get("symbols", ["PI_XBTUSD"])
 TIMEFRAME = config.get("timeframe", "1m")
@@ -42,6 +42,13 @@ log_file = f"trading_log_{date.today()}.txt"
 recent_logs = deque(maxlen=2000)
 daily_setups = deque(maxlen=300)
 
+# Cumulative stats (never reset)
+total_wins = 0
+total_losses = 0
+total_pnl = 0.0
+total_win_usd = 0.0
+total_loss_usd = 0.0
+
 def log(message, to_file=True):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
@@ -56,7 +63,7 @@ def log(message, to_file=True):
         except Exception as e:
             print(f"[LOG ERROR] {e}")
 
-# ====================== FLASK LIVE VIEWER (manual refresh only) ======================
+# ====================== FLASK LIVE VIEWER ======================
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
@@ -65,9 +72,9 @@ def show_log():
     try:
         display_content = "\n".join(recent_logs)
         
-        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-        pnl_color = "#4ade80" if daily_pnl >= 0 else "#f87171"
-        pnl_sign = "+" if daily_pnl >= 0 else ""
+        win_rate = (total_wins / (total_wins + total_losses) * 100) if (total_wins + total_losses) > 0 else 0
+        pnl_color = "#4ade80" if total_pnl >= 0 else "#f87171"
+        pnl_sign = "+" if total_pnl >= 0 else ""
 
         html = f"""
         <html>
@@ -75,11 +82,20 @@ def show_log():
             <title>Kraken ICT Bot - Live Log</title>
             <style>
                 body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.4; margin: 0; }}
-                .stats-header {{ background: #252526; border: 2px solid #3c3c3c; border-radius: 8px; padding: 15px 20px; margin-bottom: 20px; font-size: 18px; display: flex; flex-wrap: wrap; gap: 25px; align-items: center; }}
+                .stats-header {{ 
+                    background: #252526; border: 2px solid #3c3c3c; border-radius: 8px; 
+                    padding: 15px 20px; margin-bottom: 20px; font-size: 18px; 
+                    display: flex; flex-wrap: wrap; gap: 25px; align-items: center; 
+                }}
                 .stat-item {{ display: flex; align-items: center; gap: 8px; }}
                 .stat-label {{ color: #888; font-size: 14px; }}
                 .pnl {{ font-weight: bold; }}
-                pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 13px; max-height: 78vh; overflow-y: auto; background: #252526; padding: 15px; border-radius: 6px; border: 1px solid #3c3c3c; }}
+                pre {{ 
+                    white-space: pre-wrap; word-wrap: break-word; font-size: 13px; 
+                    max-height: 78vh; overflow-y: auto;
+                    background: #252526; padding: 15px;
+                    border-radius: 6px; border: 1px solid #3c3c3c;
+                }}
                 .header {{ color: #569cd6; }}
             </style>
         </head>
@@ -87,11 +103,13 @@ def show_log():
             <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Manual Refresh)</h2>
             
             <div class="stats-header">
-                <div class="stat-item"><span class="stat-label">WINS</span><strong style="color:#4ade80">{wins}</strong></div>
-                <div class="stat-item"><span class="stat-label">LOSSES</span><strong style="color:#f87171">{losses}</strong></div>
+                <div class="stat-item"><span class="stat-label">WINS</span><strong style="color:#4ade80">{total_wins}</strong></div>
+                <div class="stat-item"><span class="stat-label">LOSSES</span><strong style="color:#f87171">{total_losses}</strong></div>
                 <div class="stat-item"><span class="stat-label">WIN RATE</span><strong>{win_rate:.1f}%</strong></div>
                 <div class="stat-item"><span class="stat-label">TRADES TODAY</span><strong>{daily_trades}</strong></div>
-                <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${daily_pnl:.2f}</strong></div>
+                <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${total_pnl:.2f}</strong></div>
+                <div class="stat-item"><span class="stat-label">WON USD</span><strong style="color:#4ade80">${total_win_usd:.2f}</strong></div>
+                <div class="stat-item"><span class="stat-label">LOST USD</span><strong style="color:#f87171">${total_loss_usd:.2f}</strong></div>
             </div>
 
             <pre id="logpre">{display_content}</pre>
@@ -114,6 +132,13 @@ def run_flask():
 candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
 last_trade_time = None
+
+def get_account_balance():
+    try:
+        balance = exchange.fetch_balance()
+        return float(balance.get('USDT', {}).get('free', 100.0))
+    except:
+        return 100.0
 
 def calculate_atr(df, period=14):
     high_low = df['high'] - df['low']
@@ -174,7 +199,6 @@ async def fetch_latest_candles(symbol, tf, limit=500):
         return pd.DataFrame()
 
 async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd, score, choch_level):
-    # ... (same detailed logging as before)
     log(f"=== ATTEMPTING ORDER === [{symbol}] {side.upper()} | Score: {score:.1f} | CHOCH Level: {choch_level:.4f}", to_file=True)
     try:
         m = exchange.market(symbol)
@@ -208,7 +232,7 @@ Entry      : {current_price:.4f}
 Stop Loss  : {stop_price:.4f}
 Take Profit: {tp_price:.4f} ({RR_RATIO:.1f}R)
 Quantity   : {quantity:.4f}
-Risk USD   : ${risk_usd:.2f}
+Risk       : ${risk_usd:.2f} ({RISK_PERCENT}% of account)
 Leverage   : {LEVERAGE}x
 Score      : {score:.1f}
 CHOCH Level: {choch_level:.4f}
@@ -283,21 +307,35 @@ async def manage_open_trade(symbol, df):
             hit = True
 
     if hit:
-        global daily_pnl, wins, losses
+        global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
         daily_pnl += pnl
+        total_pnl += pnl
+
         if result == "WIN":
-            wins += 1
+            total_wins += 1
+            total_win_usd += abs(pnl)
         else:
-            losses += 1
+            total_losses += 1
+            total_loss_usd += abs(pnl)
+
         duration = (datetime.now() - trade['open_time']).seconds // 60
         log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED | PNL: ${pnl:.2f} | Duration: {duration} min", to_file=True)
         del active_trades[symbol]
 
 async def main():
-    global daily_trades, daily_pnl, wins, losses, current_day, log_file, last_trade_time
-    log("🚀 Full Video Strategy + Detailed Position Logging + Manual Refresh + Fixed Stop Distance\n", to_file=True)
+    global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time
+    log("🚀 Real Money Ready - Cumulative Stats + No Daily Reset + USD Win/Loss Tracking\n", to_file=True)
 
-    # ... (startup position check unchanged)
+    try:
+        positions = exchange.fetch_positions()
+        for pos in positions:
+            if float(pos.get('contracts', 0)) != 0:
+                symbol = pos['symbol']
+                side = 'buy' if float(pos['contracts']) > 0 else 'sell'
+                log(f"🔄 Found existing {side.upper()} position on {symbol}", to_file=True)
+                active_trades[symbol] = {'side': side, 'entry_price': float(pos.get('entryPrice', 0)), 'stop_price': 0, 'tp_price': 0, 'quantity': abs(float(pos['contracts'])), 'open_time': datetime.now(), 'choch_level': 0, 'breakeven_moved': False}
+    except Exception as e:
+        log(f"Warning: Could not load positions: {e}", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
@@ -308,13 +346,9 @@ async def main():
         try:
             today = date.today()
             if today != current_day:
-                win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-                log(f"\n📅 === DAILY SUMMARY ({current_day}) === Trades: {daily_trades} | PNL: ${daily_pnl:.2f} | Win Rate: {win_rate:.1f}%", to_file=True)
                 log_file = f"trading_log_{today}.txt"
                 daily_trades = 0
                 daily_pnl = 0.0
-                wins = 0
-                losses = 0
                 current_day = today
                 daily_setups.clear()
                 last_trade_time = None
@@ -399,10 +433,9 @@ async def main():
             if best_setup and daily_trades < MAX_TRADES_PER_DAY and (can_trade or allow_by_wiggle):
                 symbol, direction, current_price, fvg_extreme, dynamic_buffer = best_setup
 
-                # === FIXED STOP LOSS CALCULATION WITH MINIMUM DISTANCE ===
                 if direction == 'bullish':
                     stop_price = fvg_extreme - dynamic_buffer
-                    min_distance = max(current_price * 0.0015, 0.00005)  # 0.15% or minimum tick
+                    min_distance = max(current_price * 0.0015, 0.00005)
                     if stop_price >= current_price - min_distance:
                         log(f"⚠️ [{symbol}] Skipped bad setup (stop too close to entry)", to_file=False)
                         continue
@@ -443,8 +476,8 @@ if __name__ == "__main__":
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: ${RISK_USD} | Max Trades/Day: {MAX_TRADES_PER_DAY} | Minimum Stop Distance Protection")
-    log(f"Symbols: {SYMBOLS} | Full Video Strategy + Ranking + Breakeven + Fixed Stop Loss\n", to_file=True)
+    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | Cumulative stats enabled")
+    log(f"Symbols: {SYMBOLS} | Real Money Ready + No Daily Reset\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()

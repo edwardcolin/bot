@@ -1,5 +1,5 @@
 {
-  "risk_usd": 1.0,
+  "risk_percent": 0.6,
   "leverage": 5,
   "symbols": ["PI_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_DOGEUSD", "PF_XRPUSD"],
   "timeframe": "1m",
