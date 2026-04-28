@@ -10,6 +10,7 @@ from flask import Flask, Response
 import threading
 import logging
 from collections import deque
+import time
 
 load_dotenv()
 
@@ -21,7 +22,6 @@ RISK_PERCENT = config.get("risk_percent", 1.0)
 LEVERAGE = config.get("leverage", 5)
 SYMBOLS = config.get("symbols", ["PI_XBTUSD"])
 TIMEFRAME = config.get("timeframe", "1m")
-HTF_TIMEFRAME = "15m"
 WARMUP_MINUTES = config.get("warmup_minutes", 0)
 MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 9)
 MAX_DAILY_LOSS_USD = config.get("max_daily_loss_usd", 5.0)
@@ -32,9 +32,26 @@ exchange = ccxt.krakenfutures({
     'apiKey': os.getenv('KRAKEN_API_KEY'),
     'secret': os.getenv('KRAKEN_API_SECRET'),
     'enableRateLimit': True,
+    'timeout': 15000,
 })
 exchange.set_sandbox_mode(USE_TESTNET)
-exchange.load_markets()
+
+# ====================== ROBUST MARKET LOAD (fixes timeout) ======================
+def load_markets_robust():
+    for attempt in range(3):
+        try:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 📡 Loading markets (attempt {attempt+1}/3)...")
+            markets = exchange.load_markets()
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Loaded {len(markets)} markets successfully")
+            return markets
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Market load failed (attempt {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(5)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Could not load markets. Continuing with safe defaults...")
+    return {}
+
+load_markets_robust()
 
 # ====================== LOGGING SETUP ======================
 log_file = f"trading_log_{date.today()}.txt"
@@ -96,7 +113,7 @@ def show_log():
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - LIVE (Exact CHOCH+FVG from Transcript - 1m only)</h2>
+            <h2 class="header">🚀 Kraken ICT Bot - LIVE (1m CHOCH 90min Pattern + FVG)</h2>
             <div class="buttons">
                 <button onclick="clearLogs()">🗑️ Clear Logs</button>
                 <button onclick="resetDailyStats()">🔄 Reset Daily Stats</button>
@@ -172,32 +189,38 @@ def detect_swing_highs_lows(df, strength=5):
     return df
 
 def detect_choch(df):
-    df = detect_swing_highs_lows(df)
+    """1m-only CHOCH with 90-minute pattern recognition (exactly as requested)"""
+    if len(df) < 100:
+        return []
+    recent_df = df.iloc[-90:].copy()
+    recent_df = detect_swing_highs_lows(recent_df)
     signals = []
-    for i in range(40, len(df)):
-        recent_highs = df['swing_high'].iloc[i-40:i].dropna()
-        recent_lows = df['swing_low'].iloc[i-40:i].dropna()
+    for i in range(20, len(recent_df)):
+        recent_highs = recent_df['swing_high'].iloc[i-20:i].dropna()
+        recent_lows = recent_df['swing_low'].iloc[i-20:i].dropna()
         if len(recent_highs) < 3 or len(recent_lows) < 3:
             continue
         # Bullish CHOCH
-        if (df['close'].iloc[i] > recent_highs.iloc[-1] and df['close'].iloc[i-1] <= recent_highs.iloc[-1] and
+        if (recent_df['close'].iloc[i] > recent_highs.iloc[-1] and 
+            recent_df['close'].iloc[i-1] <= recent_highs.iloc[-1] and
             recent_highs.iloc[-1] > recent_highs.iloc[-2]):
-            signals.append(('bullish', i, recent_highs.iloc[-1]))
+            signals.append(('bullish', len(df)-90+i, recent_highs.iloc[-1]))
         # Bearish CHOCH
-        if (df['close'].iloc[i] < recent_lows.iloc[-1] and df['close'].iloc[i-1] >= recent_lows.iloc[-1] and
+        if (recent_df['close'].iloc[i] < recent_lows.iloc[-1] and 
+            recent_df['close'].iloc[i-1] >= recent_lows.iloc[-1] and
             recent_lows.iloc[-1] < recent_lows.iloc[-2]):
-            signals.append(('bearish', i, recent_lows.iloc[-1]))
+            signals.append(('bearish', len(df)-90+i, recent_lows.iloc[-1]))
     return signals
 
 def detect_fvg(df):
     fvgs = []
     for i in range(3, len(df)):
         c1, c2, c3 = df.iloc[i-3:i]
-        # Bullish FVG - three green candles + no wick overlap
+        # Bullish FVG
         if (c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and c1['high'] < c3['low']):
             midpoint = (c1['high'] + c3['low']) / 2
             fvgs.append(('bullish', midpoint, c3['low'], i, c1['high'], c3['low'], i-1))
-        # Bearish FVG - three red candles + no wick overlap
+        # Bearish FVG
         if (c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and c1['low'] > c3['high']):
             midpoint = (c1['low'] + c3['high']) / 2
             fvgs.append(('bearish', midpoint, c3['high'], i, c1['low'], c3['high'], i-1))
@@ -210,7 +233,7 @@ async def fetch_latest_candles(symbol, tf, limit=500):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        log(f"❌ Candle error ({tf}) for {symbol}: {e}", to_file=False, to_recent=False)
+        log(f"❌ Candle error for {symbol}: {e}", to_file=False, to_recent=False)
         return pd.DataFrame()
 
 async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd, score, choch_level, fvg_extreme):
@@ -254,7 +277,7 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             'fvg_extreme': float(fvg_extreme),
             'breakeven_moved': False
         }
-        log(f"=== POSITION OPENED SUCCESSFULLY (Exact ICT CHOCH+FVG) ===", to_file=True)
+        log(f"=== POSITION OPENED SUCCESSFULLY (1m CHOCH+FVG) ===", to_file=True)
         return order
     except Exception as e:
         log(f"❌ ORDER FAILED: {e}", to_file=True)
@@ -267,7 +290,6 @@ async def manage_open_trade(symbol, df):
     current_price = df['close'].iloc[-1]
     fvg_extreme = trade['fvg_extreme']
 
-    # Breakeven on BOS of last FVG candle
     if not trade.get('breakeven_moved', False):
         if (trade['side'] == 'buy' and current_price > fvg_extreme) or \
            (trade['side'] == 'sell' and current_price < fvg_extreme):
@@ -282,7 +304,6 @@ async def manage_open_trade(symbol, df):
             except Exception as e:
                 log(f"⚠️ Breakeven failed: {e}", to_file=True)
 
-    # Simulated close fallback
     hit = False
     pnl = 0.0
     result = ""
@@ -319,7 +340,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Kraken ICT Bot Started - EXACT CHOCH + FVG logic (unpack error fixed)", to_file=True)
+    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + timeout fix", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
@@ -375,7 +396,6 @@ async def main():
                     if latest_choch_idx != -1 and fvg_idx < latest_choch_idx:
                         continue
 
-                    # 7-10 minute midpoint confirmation
                     confirmation_window = df1m.iloc[-12:-2]
                     if fvg_type == 'bullish':
                         confirmed = (confirmation_window['close'] > midpoint).mean() >= 0.7
