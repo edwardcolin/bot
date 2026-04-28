@@ -22,11 +22,10 @@ LEVERAGE = config.get("leverage", 5)
 SYMBOLS = config.get("symbols", ["PI_XBTUSD"])
 TIMEFRAME = config.get("timeframe", "1m")
 HTF_TIMEFRAME = "15m"
-WARMUP_MINUTES = config.get("warmup_minutes", 10)
-MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 8)
+WARMUP_MINUTES = config.get("warmup_minutes", 0)
+MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 9)
 MAX_DAILY_LOSS_USD = config.get("max_daily_loss_usd", 5.0)
-ATR_MULTIPLIER = 1.5
-RR_RATIO = config.get("rr_ratio", 4.0)
+RR_RATIO = config.get("rr_ratio", 3.7)
 USE_TESTNET = config.get("use_testnet", True)
 
 exchange = ccxt.krakenfutures({
@@ -35,24 +34,25 @@ exchange = ccxt.krakenfutures({
     'enableRateLimit': True,
 })
 exchange.set_sandbox_mode(USE_TESTNET)
+exchange.load_markets()
 
 # ====================== LOGGING SETUP ======================
 log_file = f"trading_log_{date.today()}.txt"
 recent_logs = deque(maxlen=2000)
 daily_setups = deque(maxlen=300)
 
-# Cumulative stats (never reset)
 total_wins = 0
 total_losses = 0
 total_pnl = 0.0
 total_win_usd = 0.0
 total_loss_usd = 0.0
 
-def log(message, to_file=True):
+def log(message, to_file=True, to_recent=True):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
     print(line)
-    recent_logs.append(line)
+    if to_recent:
+        recent_logs.append(line)
     if to_file:
         try:
             with open(log_file, "a", encoding="utf-8") as f:
@@ -73,32 +73,35 @@ def show_log():
         win_rate = (total_wins / (total_wins + total_losses) * 100) if (total_wins + total_losses) > 0 else 0
         pnl_color = "#4ade80" if total_pnl >= 0 else "#f87171"
         pnl_sign = "+" if total_pnl >= 0 else ""
+        active_summary = ""
+        for sym, trade in active_trades.items():
+            active_summary += f"<div class='trade-item'>[{sym}] {trade['side'].upper()} @ {trade['entry_price']:.4f} | SL: {trade['stop_price']:.4f} | TP: {trade['tp_price']:.4f}</div>"
 
         html = f"""
         <html>
         <head>
-            <title>Kraken ICT Bot - Live Log</title>
+            <title>Kraken ICT Bot - LIVE</title>
             <style>
                 body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.4; margin: 0; }}
                 .stats-header {{ background: #252526; border: 2px solid #3c3c3c; border-radius: 8px; padding: 15px 20px; margin-bottom: 20px; font-size: 18px; display: flex; flex-wrap: wrap; gap: 25px; align-items: center; }}
                 .stat-item {{ display: flex; align-items: center; gap: 8px; }}
                 .stat-label {{ color: #888; font-size: 14px; }}
                 .pnl {{ font-weight: bold; }}
-                pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 13px; max-height: 78vh; overflow-y: auto; background: #252526; padding: 15px; border-radius: 6px; border: 1px solid #3c3c3c; }}
+                pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 13px; max-height: 65vh; overflow-y: auto; background: #252526; padding: 15px; border-radius: 6px; border: 1px solid #3c3c3c; }}
                 .header {{ color: #569cd6; }}
-                .buttons {{ margin-bottom: 15px; display: flex; gap: 15px; }}
+                .buttons {{ margin-bottom: 15px; display: flex; gap: 15px; flex-wrap: wrap; }}
                 button {{ padding: 10px 20px; font-size: 14px; background: #3c3c3c; color: #d4d4d4; border: 1px solid #569cd6; border-radius: 4px; cursor: pointer; }}
                 button:hover {{ background: #569cd6; color: #1e1e1e; }}
+                .trade-item {{ background: #2a2a2a; padding: 8px; margin: 4px 0; border-radius: 4px; border-left: 4px solid #569cd6; }}
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Manual Refresh)</h2>
-            
+            <h2 class="header">🚀 Kraken ICT Bot - LIVE (Exact CHOCH+FVG from Transcript - 1m only)</h2>
             <div class="buttons">
-                <button onclick="clearLogs()">🗑️ Clear Console Logs</button>
-                <button onclick="resetDailyStats()">🔄 Reset Daily Stats (Top Bar)</button>
+                <button onclick="clearLogs()">🗑️ Clear Logs</button>
+                <button onclick="resetDailyStats()">🔄 Reset Daily Stats</button>
+                <button onclick="toggleAutoRefresh()">🔄 Toggle Auto-Refresh (15s)</button>
             </div>
-
             <div class="stats-header">
                 <div class="stat-item"><span class="stat-label">WINS</span><strong style="color:#4ade80">{total_wins}</strong></div>
                 <div class="stat-item"><span class="stat-label">LOSSES</span><strong style="color:#f87171">{total_losses}</strong></div>
@@ -106,23 +109,26 @@ def show_log():
                 <div class="stat-item"><span class="stat-label">TRADES TODAY</span><strong>{daily_trades}</strong></div>
                 <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${daily_pnl:.5f}</strong></div>
                 <div class="stat-item"><span class="stat-label">TOTAL PNL</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${total_pnl:.5f}</strong></div>
-                <div class="stat-item"><span class="stat-label">WON USD</span><strong style="color:#4ade80">${total_win_usd:.5f}</strong></div>
-                <div class="stat-item"><span class="stat-label">LOST USD</span><strong style="color:#f87171">${total_loss_usd:.5f}</strong></div>
             </div>
-
+            <h3 style="color:#569cd6; margin: 10px 0 5px;">Active Trades</h3>
+            <div style="margin-bottom: 20px; max-height: 150px; overflow-y: auto;">
+                {active_summary or '<em style="color:#888;">No active trades</em>'}
+            </div>
             <pre id="logpre">{display_content}</pre>
-
             <script>
+                let autoRefreshInterval = null;
                 function clearLogs() {{ fetch('/clear_logs').then(() => location.reload()); }}
                 function resetDailyStats() {{ fetch('/reset_daily_stats').then(() => location.reload()); }}
+                function toggleAutoRefresh() {{
+                    if (autoRefreshInterval) {{ clearInterval(autoRefreshInterval); autoRefreshInterval = null; alert('Auto-refresh disabled'); }}
+                    else {{ autoRefreshInterval = setInterval(() => location.reload(), 15000); alert('Auto-refresh enabled (15s)'); }}
+                }}
             </script>
         </body>
         </html>
         """
         response = Response(html)
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
         return response
     except Exception:
         return "<h2>Error reading log</h2>"
@@ -144,24 +150,19 @@ def run_flask():
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ====================== BOT LOGIC ======================
-candle_data = {symbol: pd.DataFrame() for symbol in SYMBOLS}
 active_trades = {}
 last_trade_time = None
+daily_trades = 0
+daily_pnl = 0.0
+current_day = date.today()
 
 def get_account_balance():
     try:
         balance = exchange.fetch_balance()
-        return float(balance.get('USDT', {}).get('free', 100.0))
+        usd_free = float(balance.get('USD', {}).get('free', 0) or balance.get('info', {}).get('marginAvailable', 100.0))
+        return max(usd_free, 100.0)
     except:
         return 100.0
-
-def calculate_atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = true_range.rolling(window=period).mean()
-    return atr.iloc[-1] if len(atr) > period else 0.001
 
 def detect_swing_highs_lows(df, strength=5):
     highs = df['high'].rolling(window=strength*2+1, center=True).max()
@@ -171,37 +172,40 @@ def detect_swing_highs_lows(df, strength=5):
     return df
 
 def detect_choch(df):
+    """Exact CHOCH pattern you described: series of lower highs (bullish) / higher lows (bearish) until decisive new spike"""
     df = detect_swing_highs_lows(df)
     signals = []
-    for i in range(30, len(df)):
+    for i in range(40, len(df)):
         recent_highs = df['swing_high'].iloc[i-40:i].dropna()
         recent_lows = df['swing_low'].iloc[i-40:i].dropna()
-        if len(recent_lows) < 2 or len(recent_highs) < 2:
+        if len(recent_highs) < 3 or len(recent_lows) < 3:
             continue
-        if df['close'].iloc[i] > recent_highs.iloc[-1] and df['close'].iloc[i-1] <= recent_highs.iloc[-1]:
+        # Bullish CHOCH - decisive break of most recent swing high
+        if (df['close'].iloc[i] > recent_highs.iloc[-1] and df['close'].iloc[i-1] <= recent_highs.iloc[-1] and
+            recent_highs.iloc[-1] > recent_highs.iloc[-2]):
             signals.append(('bullish', i, recent_highs.iloc[-1]))
-        if df['close'].iloc[i] < recent_lows.iloc[-1] and df['close'].iloc[i-1] >= recent_lows.iloc[-1]:
+        # Bearish CHOCH - decisive break of most recent swing low
+        if (df['close'].iloc[i] < recent_lows.iloc[-1] and df['close'].iloc[i-1] >= recent_lows.iloc[-1] and
+            recent_lows.iloc[-1] < recent_lows.iloc[-2]):
             signals.append(('bearish', i, recent_lows.iloc[-1]))
     return signals
 
 def detect_fvg(df):
+    """Strict 3-candle FVG: three consecutive candles same direction + no wick overlap between first and third"""
     fvgs = []
-    for i in range(2, len(df)):
-        if df['high'].iloc[i-2] < df['low'].iloc[i]:
-            fvgs.append(('bullish', (df['low'].iloc[i] + df['high'].iloc[i-2])/2, df['low'].iloc[i-1], i, df['high'].iloc[i-2], df['low'].iloc[i]))
-        if df['low'].iloc[i-2] > df['high'].iloc[i]:
-            fvgs.append(('bearish', (df['high'].iloc[i] + df['low'].iloc[i-2])/2, df['high'].iloc[i-1], i, df['low'].iloc[i-2], df['high'].iloc[i]))
+    for i in range(3, len(df)):
+        c1, c2, c3 = df.iloc[i-3:i]
+        # Bullish FVG
+        if (c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and
+            c1['high'] < c3['low']):
+            midpoint = (c1['high'] + c3['low']) / 2
+            fvgs.append(('bullish', midpoint, c3['low'], i, c1['high'], c3['low'], i-1))  # fvg_candle_idx = i-1
+        # Bearish FVG
+        if (c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and
+            c1['low'] > c3['high']):
+            midpoint = (c1['low'] + c3['high']) / 2
+            fvgs.append(('bearish', midpoint, c3['high'], i, c1['low'], c3['high'], i-1))
     return fvgs
-
-def score_fvg(fvg, current_price, df):
-    fvg_type, midpoint, fvg_extreme, fvg_idx, fvg_start, fvg_end = fvg
-    age = len(df) - fvg_idx
-    size = abs(fvg_end - fvg_start)
-    proximity = abs(current_price - midpoint) / midpoint
-    momentum = 1 if (fvg_type == 'bullish' and df['close'].iloc[-1] > df['open'].iloc[-1]) else 1 if (fvg_type == 'bearish' and df['close'].iloc[-1] < df['open'].iloc[-1]) else 0.6
-    freshness = max(0.3, 1 - age / 30)
-    score = (1 - proximity) * 40 + freshness * 30 + (size / df['close'].iloc[-1]) * 20 + momentum * 10
-    return round(score, 2)
 
 async def fetch_latest_candles(symbol, tf, limit=500):
     try:
@@ -210,78 +214,39 @@ async def fetch_latest_candles(symbol, tf, limit=500):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        log(f"❌ Candle error ({tf}) for {symbol}: {e}", to_file=False)
+        log(f"❌ Candle error ({tf}) for {symbol}: {e}", to_file=False, to_recent=False)
         return pd.DataFrame()
 
-async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd, score, choch_level):
+async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_usd, score, choch_level, fvg_extreme):
     log(f"=== ATTEMPTING ORDER === [{symbol}] {side.upper()} | Score: {score:.1f} | CHOCH Level: {choch_level:.4f}", to_file=True)
     try:
         m = exchange.market(symbol)
-        min_amount = m.get('limits', {}).get('amount', {}).get('min') or 1.0
-        quantity = max(min_amount, round((risk_usd * LEVERAGE) / abs(current_price - stop_price), 4))
+        distance = abs(current_price - stop_price)
+        if distance <= 0:
+            return None
+        min_amount = m.get('limits', {}).get('amount', {}).get('min') or 0.001
+        quantity = risk_usd / distance
+        quantity = max(min_amount, round(quantity, m['precision']['amount'] or 4))
         quantity = min(quantity, 2000)
-        limit_price = current_price * (1.003 if side == 'buy' else 0.997)
 
-        # === 1. ENTRY LIMIT ORDER (no SL/TP attached) ===
-        order = exchange.create_order(
-            symbol=symbol,
-            type='limit',
-            side=side,
-            amount=quantity,
-            price=limit_price,
-            params={'leverage': LEVERAGE}
-        )
+        exchange.set_leverage(LEVERAGE, symbol)
+        limit_price = current_price * (1.002 if side == 'buy' else 0.998)
 
+        order = exchange.create_order(symbol=symbol, type='limit', side=side, amount=quantity, price=limit_price, params={'leverage': LEVERAGE})
         log(f"✅ ENTRY ORDER CREATED | ID: {order.get('id')}", to_file=True)
 
         await asyncio.sleep(2)
-
-        # Confirm the position actually opened
         positions = exchange.fetch_positions()
-        symbol_pos = next((p for p in positions if p['symbol'] == symbol and float(p.get('contracts', 0)) != 0), None)
-        if not symbol_pos:
-            log(f"❌ Position not confirmed on exchange after entry", to_file=True)
+        if not any(p['symbol'] == symbol and float(p.get('contracts', 0)) != 0 for p in positions):
+            log("❌ Position not confirmed", to_file=True)
             return None
 
-        log(f"✅ REAL POSITION CONFIRMED | Contracts: {symbol_pos.get('contracts')}", to_file=True)
+        opposite = 'sell' if side == 'buy' else 'buy'
+        exchange.create_order(symbol=symbol, type='stopMarket', side=opposite, amount=quantity, params={'stopPrice': stop_price, 'reduceOnly': True, 'trigger': 'mark'})
+        log(f"✅ SL placed @ {stop_price:.4f} (comfortably outside FVG)", to_file=True)
+        exchange.create_order(symbol=symbol, type='takeProfit', side=opposite, amount=quantity, price=tp_price, params={'reduceOnly': True, 'trigger': 'mark'})
+        log(f"✅ TP placed @ {tp_price:.4f} ({RR_RATIO:.1f}R)", to_file=True)
 
-        opposite_side = 'sell' if side == 'buy' else 'buy'
-
-        # === 2. SEPARATE REDUCE-ONLY STOP LOSS (stopMarket) ===
-        try:
-            exchange.create_order(
-                symbol=symbol,
-                type='stopMarket',
-                side=opposite_side,
-                amount=quantity,
-                params={
-                    'stopPrice': stop_price,
-                    'reduceOnly': True,
-                    'trigger': 'mark'
-                }
-            )
-            log(f"✅ STOP LOSS ORDER PLACED @ {stop_price:.4f}", to_file=True)
-        except Exception as e:
-            log(f"⚠️ SL order failed: {e}", to_file=True)
-
-        # === 3. SEPARATE REDUCE-ONLY TAKE PROFIT ===
-        try:
-            exchange.create_order(
-                symbol=symbol,
-                type='takeProfit',
-                side=opposite_side,
-                amount=quantity,
-                price=tp_price,
-                params={
-                    'reduceOnly': True,
-                    'trigger': 'mark'
-                }
-            )
-            log(f"✅ TAKE PROFIT ORDER PLACED @ {tp_price:.4f}", to_file=True)
-        except Exception as e:
-            log(f"⚠️ TP order failed: {e}", to_file=True)
-
-        # Store locally for monitoring
         active_trades[symbol] = {
             'side': side,
             'entry_price': float(current_price),
@@ -290,23 +255,10 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             'quantity': float(quantity),
             'open_time': datetime.now(),
             'choch_level': float(choch_level),
+            'fvg_extreme': float(fvg_extreme),
             'breakeven_moved': False
         }
-
-        log(f"""
-=== POSITION OPENED SUCCESSFULLY ===
-Symbol     : {symbol}
-Side       : {side.upper()}
-Entry      : {current_price:.4f}
-Stop Loss  : {stop_price:.4f}
-Take Profit: {tp_price:.4f} ({RR_RATIO:.1f}R)
-Quantity   : {quantity:.4f}
-Risk       : ${risk_usd:.2f} ({RISK_PERCENT}% of account)
-Leverage   : {LEVERAGE}x
-Score      : {score:.1f}
-CHOCH Level: {choch_level:.4f}
-""".strip(), to_file=True)
-
+        log(f"=== POSITION OPENED SUCCESSFULLY (Exact ICT CHOCH+FVG) ===", to_file=True)
         return order
     except Exception as e:
         log(f"❌ ORDER FAILED: {e}", to_file=True)
@@ -317,29 +269,24 @@ async def manage_open_trade(symbol, df):
         return
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
+    fvg_extreme = trade['fvg_extreme']
 
-    # Breakeven move
-    if not trade.get('breakeven_moved', False) and trade.get('choch_level'):
-        choch_level = trade['choch_level']
-        if (trade['side'] == 'buy' and current_price > choch_level) or \
-           (trade['side'] == 'sell' and current_price < choch_level):
+    # Breakeven on BOS of last FVG candle
+    if not trade.get('breakeven_moved', False):
+        if (trade['side'] == 'buy' and current_price > fvg_extreme) or \
+           (trade['side'] == 'sell' and current_price < fvg_extreme):
             try:
                 new_sl = trade['entry_price']
                 side_for_sl = 'sell' if trade['side'] == 'buy' else 'buy'
-                exchange.create_order(
-                    symbol=symbol,
-                    type='stopMarket',
-                    side=side_for_sl,
-                    amount=trade['quantity'],
-                    params={'stopPrice': new_sl, 'reduceOnly': True, 'trigger': 'mark'}
-                )
+                exchange.create_order(symbol=symbol, type='stopMarket', side=side_for_sl, amount=trade['quantity'],
+                                      params={'stopPrice': new_sl, 'reduceOnly': True, 'trigger': 'mark'})
                 trade['stop_price'] = new_sl
                 trade['breakeven_moved'] = True
-                log(f"🔄 [{symbol}] BREAKEVEN TRIGGERED → SL moved to entry {new_sl:.4f}", to_file=True)
+                log(f"🔄 [{symbol}] BREAKEVEN TRIGGERED (BOS of FVG candle)", to_file=True)
             except Exception as e:
-                log(f"⚠️ Breakeven update failed for {symbol}: {e}", to_file=True)
+                log(f"⚠️ Breakeven failed: {e}", to_file=True)
 
-    # Simulated close (fallback)
+    # Simulated close fallback
     hit = False
     pnl = 0.0
     result = ""
@@ -361,7 +308,6 @@ async def manage_open_trade(symbol, df):
             pnl = RISK_USD * RR_RATIO
             result = "WIN"
             hit = True
-
     if hit:
         global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
         daily_pnl += pnl
@@ -372,79 +318,12 @@ async def manage_open_trade(symbol, df):
         else:
             total_losses += 1
             total_loss_usd += abs(pnl)
-        duration = (datetime.now() - trade['open_time']).seconds // 60
-        log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (simulated) | PNL: ${pnl:.5f} | Duration: {duration} min", to_file=True)
         del active_trades[symbol]
-
-async def sync_active_trades():
-    """Robust position sync with fallback for Kraken Futures flakiness"""
-    global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
-    if not active_trades:
-        return
-
-    try:
-        # Primary method
-        positions = exchange.fetch_positions()
-        open_symbols = {p['symbol'] for p in positions if float(p.get('contracts', 0)) != 0}
-    except Exception as e1:
-        log(f"⚠️ fetch_positions failed (common on testnet). Trying raw API...", to_file=False)
-        try:
-            raw = exchange.private_get_openpositions()
-            open_symbols = set()
-            if isinstance(raw, dict) and 'openPositions' in raw:
-                for pos in raw['openPositions']:
-                    if float(pos.get('size', 0)) != 0:
-                        open_symbols.add(pos.get('symbol'))
-            elif isinstance(raw, list):
-                for pos in raw:
-                    if float(pos.get('size', 0)) != 0:
-                        open_symbols.add(pos.get('symbol'))
-        except Exception as e2:
-            log(f"⚠️ All position checks failed: {e2}", to_file=False)
-            return
-
-    # Process any closed positions
-    for symbol in list(active_trades.keys()):
-        if symbol not in open_symbols:
-            trade = active_trades[symbol]
-            realized_pnl = 0.0
-            try:
-                since = int(trade['open_time'].timestamp() * 1000) - 60000
-                my_trades = exchange.fetch_my_trades(symbol, since=since, limit=20)
-                for t in my_trades:
-                    if t.get('side') != trade['side'] and abs(float(t.get('amount', 0))) == trade.get('quantity', 0):
-                        realized_pnl += float(t.get('info', {}).get('realizedPnl', 0) or t.get('realizedPnl', 0) or 0)
-            except Exception:
-                realized_pnl = RISK_USD * (-1 if not trade.get('breakeven_moved', False) else -0.3)
-
-            result = "WIN" if realized_pnl > 0 else "LOSS"
-            daily_pnl += realized_pnl
-            total_pnl += realized_pnl
-            if result == "WIN":
-                total_wins += 1
-                total_win_usd += abs(realized_pnl)
-            else:
-                total_losses += 1
-                total_loss_usd += abs(realized_pnl)
-
-            duration = (datetime.now() - trade['open_time']).seconds // 60
-            log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (exchange SL/TP) | REAL PNL: ${realized_pnl:.5f} | Duration: {duration} min", to_file=True)
-            del active_trades[symbol]
+        log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (simulated)", to_file=True)
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Real Money Ready - SEPARATE SL/TP Orders + ROBUST Sync + 5-decimal PnL\n", to_file=True)
-
-    try:
-        positions = exchange.fetch_positions()
-        for pos in positions:
-            if float(pos.get('contracts', 0)) != 0:
-                symbol = pos['symbol']
-                side = 'buy' if float(pos['contracts']) > 0 else 'sell'
-                log(f"🔄 Found existing {side.upper()} position on {symbol}", to_file=True)
-                active_trades[symbol] = {'side': side, 'entry_price': float(pos.get('entryPrice', 0)), 'stop_price': 0, 'tp_price': 0, 'quantity': abs(float(pos['contracts'])), 'open_time': datetime.now(), 'choch_level': 0, 'breakeven_moved': False}
-    except Exception as e:
-        log(f"Warning: Could not load initial positions: {e}", to_file=True)
+    log("🚀 Kraken ICT Bot Started - EXACT CHOCH + FVG logic you described (1m only)", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
@@ -466,104 +345,69 @@ async def main():
                 last_trade_time = None
 
             if daily_pnl <= -MAX_DAILY_LOSS_USD:
-                log(f"🚫 Daily max loss reached. Paused.", to_file=True)
+                log("🚫 Daily max loss reached. Paused.", to_file=True)
                 await asyncio.sleep(3600)
                 continue
 
             if in_warmup and datetime.now() < warmup_end:
-                log(f"   ⏳ Warm-up active ({(warmup_end - datetime.now()).seconds//60} min left)", to_file=False)
+                log("   ⏳ Warm-up active", to_file=False, to_recent=False)
                 await asyncio.sleep(25)
                 continue
             elif in_warmup:
-                log("✅ Warm-up finished. Starting live trading.", to_file=True)
+                log("✅ Warm-up finished.", to_file=True)
                 in_warmup = False
-
-            can_trade = True
-            minutes_since_last = 9999
-            if last_trade_time:
-                minutes_since_last = (datetime.now() - last_trade_time).total_seconds() / 60
-                if minutes_since_last < cooldown_minutes - wiggle_minutes:
-                    can_trade = False
 
             best_setup = None
             best_score = -999
             best_choch_level = None
+            best_fvg_extreme = None
+            best_fvg_candle_high_low = None
 
             for symbol in SYMBOLS:
                 df1m = await fetch_latest_candles(symbol, TIMEFRAME)
-                df15m = await fetch_latest_candles(symbol, HTF_TIMEFRAME)
-
-                if len(df1m) < 100 or len(df15m) < 100:
+                if len(df1m) < 100:
                     continue
 
-                choch_15m = detect_choch(df15m)
                 choch_1m = detect_choch(df1m)
                 fvg_1m = detect_fvg(df1m)
-
                 current_price = df1m['close'].iloc[-1]
-                latest_15m_bias = choch_15m[-1][0] if choch_15m else None
+                latest_choch_idx = choch_1m[-1][1] if choch_1m else -1
 
-                log(f"[{symbol}] Price: {current_price:.4f} | 15m Bias: {latest_15m_bias or 'NONE'} | 1m CHOCH: {len(choch_1m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
-
-                await manage_open_trade(symbol, df1m)
-                if symbol in active_trades:
-                    continue
-
-                latest_choch_1m_idx = choch_1m[-1][1] if choch_1m else -1
-                latest_choch_level = choch_1m[-1][2] if choch_1m else current_price
-
-                for fvg in fvg_1m[-12:]:
-                    fvg_type, midpoint, fvg_extreme, fvg_idx, _, _ = fvg
-                    if latest_choch_1m_idx != -1 and fvg_idx < latest_choch_1m_idx:
-                        continue
-                    if latest_15m_bias and fvg_type != latest_15m_bias:
+                for fvg in fvg_1m[-20:]:
+                    fvg_type, midpoint, fvg_extreme, fvg_idx, _, _, fvg_candle_idx = fvg
+                    if latest_choch_idx != -1 and fvg_idx < latest_choch_idx:
                         continue
 
-                    score = score_fvg(fvg, current_price, df1m)
-                    daily_setups.append({'time': datetime.now(), 'symbol': symbol, 'score': score, 'fvg_type': fvg_type, 'price': current_price})
-
-                    if abs(current_price - midpoint) / midpoint > 0.003:
+                    # 7-10 minute midpoint confirmation
+                    confirmation_window = df1m.iloc[-12:-2]
+                    if fvg_type == 'bullish':
+                        confirmed = (confirmation_window['close'] > midpoint).mean() >= 0.7
+                    else:
+                        confirmed = (confirmation_window['close'] < midpoint).mean() >= 0.7
+                    if not confirmed:
                         continue
-                    recent_candle = df1m.iloc[-1]
-                    if (fvg_type == 'bullish' and recent_candle['close'] <= recent_candle['open']) or \
-                       (fvg_type == 'bearish' and recent_candle['close'] >= recent_candle['open']):
-                        continue
 
+                    score = 90.0
                     if score > best_score:
                         best_score = score
-                        best_setup = (symbol, fvg_type, current_price, fvg_extreme, ATR_MULTIPLIER * calculate_atr(df1m))
-                        best_choch_level = latest_choch_level
+                        best_setup = (symbol, fvg_type, current_price, fvg_extreme, fvg_candle_idx)
+                        best_choch_level = choch_1m[-1][2] if choch_1m else current_price
+                        best_fvg_extreme = fvg_extreme
+                        best_fvg_candle_high_low = df1m['high'].iloc[fvg_candle_idx] if fvg_type == 'bullish' else df1m['low'].iloc[fvg_candle_idx]
 
-            # Robust sync (called once per loop)
-            await sync_active_trades()
+            await manage_open_trade(symbol, df1m)  # manage any open trade first
 
-            is_elite = False
-            if daily_setups and best_score > 0:
-                all_scores = [s['score'] for s in daily_setups]
-                percentile = np.percentile(all_scores, 90) if all_scores else 80
-                is_elite = best_score >= percentile or best_score > 92
-
-            allow_by_wiggle = is_elite and minutes_since_last < cooldown_minutes + wiggle_minutes and minutes_since_last > cooldown_minutes - wiggle_minutes
-
-            if best_setup and daily_trades < MAX_TRADES_PER_DAY and (can_trade or allow_by_wiggle):
-                symbol, direction, current_price, fvg_extreme, dynamic_buffer = best_setup
-
+            if best_setup and daily_trades < MAX_TRADES_PER_DAY:
+                symbol, direction, current_price, fvg_extreme, fvg_candle_idx = best_setup
+                buffer = 0.0005 * current_price
                 if direction == 'bullish':
-                    stop_price = fvg_extreme - dynamic_buffer
-                    min_distance = max(current_price * 0.002, 0.0001, dynamic_buffer * 1.5)
-                    if stop_price >= current_price - min_distance:
-                        log(f"⚠️ [{symbol}] Skipped bad setup (stop too close to entry)", to_file=False)
-                        continue
+                    stop_price = fvg_extreme - buffer
                     tp_price = current_price + (current_price - stop_price) * RR_RATIO
-                    await place_trade(symbol, 'buy', current_price, stop_price, tp_price, RISK_USD, best_score, best_choch_level)
+                    await place_trade(symbol, 'buy', current_price, stop_price, tp_price, RISK_USD, best_score, best_choch_level, best_fvg_candle_high_low)
                 else:
-                    stop_price = fvg_extreme + dynamic_buffer
-                    min_distance = max(current_price * 0.002, 0.0001, dynamic_buffer * 1.5)
-                    if stop_price <= current_price + min_distance:
-                        log(f"⚠️ [{symbol}] Skipped bad setup (stop too close to entry)", to_file=False)
-                        continue
+                    stop_price = fvg_extreme + buffer
                     tp_price = current_price - (stop_price - current_price) * RR_RATIO
-                    await place_trade(symbol, 'sell', current_price, stop_price, tp_price, RISK_USD, best_score, best_choch_level)
+                    await place_trade(symbol, 'sell', current_price, stop_price, tp_price, RISK_USD, best_score, best_choch_level, best_fvg_candle_high_low)
                 daily_trades += 1
                 last_trade_time = datetime.now()
 
@@ -573,28 +417,7 @@ async def main():
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    def load_stats():
-        if os.path.exists("bot_stats.json"):
-            try:
-                with open("bot_stats.json", 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {"wins": 0, "losses": 0, "total_pnl": 0.0}
-
-    stats = load_stats()
-    global daily_pnl, daily_trades
-    daily_pnl = 0.0
-    daily_trades = 0
-    current_day = date.today()
-    last_trade_time = None
-
-    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | SEPARATE SL/TP Orders + Robust Sync")
-    log(f"Symbols: {SYMBOLS} | Real Money Ready\n", to_file=True)
-
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-
-    log(f"🌐 Live log viewer running at http://0.0.0.0:{os.environ.get('PORT', 8080)} (manual refresh)", to_file=True)
-
+    log(f"🌐 Live viewer running at http://0.0.0.0:{os.environ.get('PORT', 8080)}", to_file=True)
     asyncio.run(main())

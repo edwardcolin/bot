@@ -1,10 +1,10 @@
 {
   "risk_percent": 0.6,
   "leverage": 5,
-  "symbols": ["PI_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_DOGEUSD", "PF_XRPUSD"],
+  "symbols": ["PI_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_DOGEUSD", "PF_XRPUSD", "PF_AVAXUSD"],
   "timeframe": "1m",
   "warmup_minutes": 0,
-  "max_trades_per_day": 9,
+  "max_trades_per_day": 50,
   "max_daily_loss_usd": 5.0,
   "stop_buffer_ticks": 5,
   "rr_ratio": 3.7,
