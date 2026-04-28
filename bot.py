@@ -292,6 +292,45 @@ def _compute_realized_pnl(symbol, trade, exit_price):
     realized = gross - fee_total
     return realized, fee_total
 
+def _floor_to_step(value, step):
+    if step <= 0:
+        return max(value, 0.0)
+    units = int(value / step)
+    return max(units * step, 0.0)
+
+def _estimate_stop_loss_usd(market, contracts, entry_price, stop_price):
+    contracts = _safe_float(contracts, 0.0)
+    entry_price = _safe_float(entry_price, 0.0)
+    stop_price = _safe_float(stop_price, 0.0)
+    if contracts <= 0 or entry_price <= 0 or stop_price <= 0:
+        return 0.0
+    price_distance = abs(entry_price - stop_price)
+    contract_size = _safe_float(market.get('contractSize'), 1.0) or 1.0
+
+    # Approximate USD risk from stop distance by contract type.
+    if market.get('linear'):
+        return contracts * contract_size * price_distance
+    if market.get('inverse'):
+        denom = max(min(entry_price, stop_price), 1e-8)
+        return contracts * contract_size * (price_distance / denom)
+    return contracts * price_distance
+
+def _estimate_initial_margin_usd(market, contracts, entry_price, leverage):
+    contracts = _safe_float(contracts, 0.0)
+    entry_price = _safe_float(entry_price, 0.0)
+    leverage = max(_safe_float(leverage, 1.0), 1.0)
+    if contracts <= 0 or entry_price <= 0:
+        return 0.0
+    contract_size = _safe_float(market.get('contractSize'), 1.0) or 1.0
+    if market.get('linear'):
+        notional = contracts * contract_size * entry_price
+    elif market.get('inverse'):
+        notional = contracts * contract_size
+    else:
+        notional = contracts * entry_price
+    # Keep a small buffer for fees/slippage.
+    return (notional / leverage) * 1.05
+
 def refresh_live_balance():
     try:
         balance = exchange.fetch_balance()
@@ -384,37 +423,81 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         if distance <= 0:
             return None
 
-        min_amount = m.get('limits', {}).get('amount', {}).get('min') or 1
-        quantity = risk_usd / distance
-        quantity = round(quantity)
-        quantity = max(int(min_amount), int(quantity))
-        quantity = min(quantity, 2000)
+        min_amount = _safe_float(m.get('limits', {}).get('amount', {}).get('min'), 1.0) or 1.0
+        precision_amount = m.get('precision', {}).get('amount')
+        step = 1.0
+        if precision_amount is not None:
+            try:
+                step = 10 ** (-int(precision_amount))
+            except Exception:
+                step = 1.0
 
         balance_snapshot = refresh_live_balance()
         available_usd = _safe_float(balance_snapshot.get("available_usd"), 0.0)
         if available_usd <= 0:
             log(f"⚠️ [{symbol}] No available balance; skipping order", to_file=True)
             return None
-        max_affordable_contracts = int((available_usd * LEVERAGE) / max(current_price, 1e-8))
-        if max_affordable_contracts <= 0:
-            log(f"⚠️ [{symbol}] Available balance too low after leverage check; skipping", to_file=True)
+
+        per_contract_risk = _estimate_stop_loss_usd(m, 1.0, current_price, stop_price)
+        if per_contract_risk <= 0:
+            log(f"⚠️ [{symbol}] Invalid per-contract stop risk; skipping order", to_file=True)
             return None
-        if quantity > max_affordable_contracts:
+
+        raw_quantity = max(risk_usd / per_contract_risk, 0.0)
+        quantity = _floor_to_step(raw_quantity, step)
+        if quantity < min_amount:
             log(
-                f"⚠️ [{symbol}] Size capped by available margin: {quantity} -> {max_affordable_contracts} contracts "
-                f"(avail=${available_usd:.5f}, lev={LEVERAGE}x)",
+                f"⚠️ [{symbol}] Risk target too small for min size. "
+                f"risk=${risk_usd:.5f}, per_contract_risk=${per_contract_risk:.5f}, min_amount={min_amount}",
                 to_file=True
             )
-            quantity = max(int(min_amount), max_affordable_contracts)
-        if quantity < int(min_amount):
-            log(f"⚠️ [{symbol}] Quantity below minimum amount after balance checks; skipping", to_file=True)
             return None
+
+        max_by_cap = _floor_to_step(2000.0, step)
+        if m.get('linear'):
+            contract_size = _safe_float(m.get('contractSize'), 1.0) or 1.0
+            max_by_margin = _floor_to_step((available_usd * LEVERAGE) / max(current_price * contract_size, 1e-8), step)
+        elif m.get('inverse'):
+            contract_size = _safe_float(m.get('contractSize'), 1.0) or 1.0
+            max_by_margin = _floor_to_step((available_usd * LEVERAGE) / max(contract_size, 1e-8), step)
+        else:
+            max_by_margin = _floor_to_step((available_usd * LEVERAGE) / max(current_price, 1e-8), step)
+        if max_by_margin <= 0:
+            log(f"⚠️ [{symbol}] Available balance too low after leverage check; skipping", to_file=True)
+            return None
+        quantity = min(quantity, max_by_margin, max_by_cap)
+
+        est_risk = _estimate_stop_loss_usd(m, quantity, current_price, stop_price)
+        while quantity >= min_amount and est_risk > (risk_usd * 1.001):
+            quantity = _floor_to_step(quantity - step, step)
+            est_risk = _estimate_stop_loss_usd(m, quantity, current_price, stop_price)
+
+        if quantity < min_amount:
+            log(
+                f"⚠️ [{symbol}] Could not fit min lot within risk target. "
+                f"Target=${risk_usd:.5f}, min_lot_risk=${_estimate_stop_loss_usd(m, min_amount, current_price, stop_price):.5f}",
+                to_file=True
+            )
+            return None
+
+        required_margin = _estimate_initial_margin_usd(m, quantity, current_price, LEVERAGE)
+        if required_margin > available_usd:
+            log(
+                f"⚠️ [{symbol}] Required margin too high. Need~${required_margin:.5f}, available=${available_usd:.5f}",
+                to_file=True
+            )
+            return None
+        log(
+            f"📐 [{symbol}] Sized order | qty={quantity} | target_risk=${risk_usd:.5f} | est_risk=${est_risk:.5f} "
+            f"| req_margin~${required_margin:.5f} | avail=${available_usd:.5f}",
+            to_file=True
+        )
 
         # Conservative adjustment to avoid insufficientAvailableFunds
         try:
             exchange.set_leverage(LEVERAGE, symbol)
-        except:
-            pass
+        except Exception as e:
+            log(f"⚠️ [{symbol}] set_leverage failed ({LEVERAGE}x): {e}", to_file=True)
 
         limit_price = current_price * (1.002 if side == 'buy' else 0.998)
 
@@ -493,6 +576,8 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             "tp_price": float(tp_price),
             "quantity": float(quantity),
             "risk_usd": float(risk_usd),
+            "estimated_stop_loss_usd": float(est_risk),
+            "required_margin_estimate_usd": float(required_margin),
             "available_usd_at_entry": float(available_usd),
             "leverage": int(LEVERAGE),
             "order_ids": {
