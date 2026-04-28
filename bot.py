@@ -6,11 +6,10 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
-from flask import Flask, Response, request
+from flask import Flask, Response
 import threading
 import logging
 from collections import deque
-import traceback
 
 load_dotenv()
 
@@ -223,22 +222,76 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         quantity = min(quantity, 2000)
         limit_price = current_price * (1.003 if side == 'buy' else 0.997)
 
-        params = {
-            'leverage': LEVERAGE,
-            'stopLoss': {'type': 'stop', 'price': stop_price, 'trigger': 'mark'},
-            'takeProfit': {'type': 'takeProfit', 'price': tp_price, 'trigger': 'mark'}
-        }
-
+        # === 1. ENTRY LIMIT ORDER (no SL/TP attached) ===
         order = exchange.create_order(
             symbol=symbol,
             type='limit',
             side=side,
             amount=quantity,
             price=limit_price,
-            params=params
+            params={'leverage': LEVERAGE}
         )
 
-        log(f"✅ ORDER CREATED | ID: {order.get('id')}", to_file=True)
+        log(f"✅ ENTRY ORDER CREATED | ID: {order.get('id')}", to_file=True)
+
+        await asyncio.sleep(2)
+
+        # Confirm the position actually opened
+        positions = exchange.fetch_positions()
+        symbol_pos = next((p for p in positions if p['symbol'] == symbol and float(p.get('contracts', 0)) != 0), None)
+        if not symbol_pos:
+            log(f"❌ Position not confirmed on exchange after entry", to_file=True)
+            return None
+
+        log(f"✅ REAL POSITION CONFIRMED | Contracts: {symbol_pos.get('contracts')}", to_file=True)
+
+        opposite_side = 'sell' if side == 'buy' else 'buy'
+
+        # === 2. SEPARATE REDUCE-ONLY STOP LOSS (stopMarket) ===
+        try:
+            exchange.create_order(
+                symbol=symbol,
+                type='stopMarket',
+                side=opposite_side,
+                amount=quantity,
+                params={
+                    'stopPrice': stop_price,
+                    'reduceOnly': True,
+                    'trigger': 'mark'
+                }
+            )
+            log(f"✅ STOP LOSS ORDER PLACED @ {stop_price:.4f}", to_file=True)
+        except Exception as e:
+            log(f"⚠️ SL order failed: {e}", to_file=True)
+
+        # === 3. SEPARATE REDUCE-ONLY TAKE PROFIT ===
+        try:
+            exchange.create_order(
+                symbol=symbol,
+                type='takeProfit',
+                side=opposite_side,
+                amount=quantity,
+                price=tp_price,
+                params={
+                    'reduceOnly': True,
+                    'trigger': 'mark'
+                }
+            )
+            log(f"✅ TAKE PROFIT ORDER PLACED @ {tp_price:.4f}", to_file=True)
+        except Exception as e:
+            log(f"⚠️ TP order failed: {e}", to_file=True)
+
+        # Store locally for monitoring
+        active_trades[symbol] = {
+            'side': side,
+            'entry_price': float(current_price),
+            'stop_price': float(stop_price),
+            'tp_price': float(tp_price),
+            'quantity': float(quantity),
+            'open_time': datetime.now(),
+            'choch_level': float(choch_level),
+            'breakeven_moved': False
+        }
 
         log(f"""
 === POSITION OPENED SUCCESSFULLY ===
@@ -254,22 +307,6 @@ Score      : {score:.1f}
 CHOCH Level: {choch_level:.4f}
 """.strip(), to_file=True)
 
-        await asyncio.sleep(2)
-        positions = exchange.fetch_positions()
-        symbol_pos = next((p for p in positions if p['symbol'] == symbol and float(p.get('contracts', 0)) != 0), None)
-        if symbol_pos:
-            log(f"✅ REAL POSITION CONFIRMED | Contracts: {symbol_pos.get('contracts')}", to_file=True)
-
-        active_trades[symbol] = {
-            'side': side,
-            'entry_price': float(current_price),
-            'stop_price': float(stop_price),
-            'tp_price': float(tp_price),
-            'quantity': float(quantity),
-            'open_time': datetime.now(),
-            'choch_level': float(choch_level),
-            'breakeven_moved': False
-        }
         return order
     except Exception as e:
         log(f"❌ ORDER FAILED: {e}", to_file=True)
@@ -281,6 +318,7 @@ async def manage_open_trade(symbol, df):
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
 
+    # Breakeven move
     if not trade.get('breakeven_moved', False) and trade.get('choch_level'):
         choch_level = trade['choch_level']
         if (trade['side'] == 'buy' and current_price > choch_level) or \
@@ -301,7 +339,7 @@ async def manage_open_trade(symbol, df):
             except Exception as e:
                 log(f"⚠️ Breakeven update failed for {symbol}: {e}", to_file=True)
 
-    # Simulated close (fallback only)
+    # Simulated close (fallback)
     hit = False
     pnl = 0.0
     result = ""
@@ -351,7 +389,6 @@ async def sync_active_trades():
     except Exception as e1:
         log(f"⚠️ fetch_positions failed (common on testnet). Trying raw API...", to_file=False)
         try:
-            # Fallback: direct Kraken Futures endpoint
             raw = exchange.private_get_openpositions()
             open_symbols = set()
             if isinstance(raw, dict) and 'openPositions' in raw:
@@ -362,8 +399,6 @@ async def sync_active_trades():
                 for pos in raw:
                     if float(pos.get('size', 0)) != 0:
                         open_symbols.add(pos.get('symbol'))
-            else:
-                open_symbols = set()
         except Exception as e2:
             log(f"⚠️ All position checks failed: {e2}", to_file=False)
             return
@@ -374,14 +409,12 @@ async def sync_active_trades():
             trade = active_trades[symbol]
             realized_pnl = 0.0
             try:
-                # Try to get real PnL from recent trades
                 since = int(trade['open_time'].timestamp() * 1000) - 60000
                 my_trades = exchange.fetch_my_trades(symbol, since=since, limit=20)
                 for t in my_trades:
                     if t.get('side') != trade['side'] and abs(float(t.get('amount', 0))) == trade.get('quantity', 0):
                         realized_pnl += float(t.get('info', {}).get('realizedPnl', 0) or t.get('realizedPnl', 0) or 0)
             except Exception:
-                # Fallback approximation if trade fetch also fails
                 realized_pnl = RISK_USD * (-1 if not trade.get('breakeven_moved', False) else -0.3)
 
             result = "WIN" if realized_pnl > 0 else "LOSS"
@@ -400,7 +433,7 @@ async def sync_active_trades():
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Real Money Ready - ROBUST SL/TP Sync (with fallback) + 5-decimal PnL\n", to_file=True)
+    log("🚀 Real Money Ready - SEPARATE SL/TP Orders + ROBUST Sync + 5-decimal PnL\n", to_file=True)
 
     try:
         positions = exchange.fetch_positions()
@@ -501,10 +534,9 @@ async def main():
                         best_setup = (symbol, fvg_type, current_price, fvg_extreme, ATR_MULTIPLIER * calculate_atr(df1m))
                         best_choch_level = latest_choch_level
 
-            # ←←← ROBUST SYNC CALLED ONLY ONCE PER CYCLE ←←←
+            # Robust sync (called once per loop)
             await sync_active_trades()
 
-            # ... rest of trading logic (unchanged)
             is_elite = False
             if daily_setups and best_score > 0:
                 all_scores = [s['score'] for s in daily_setups]
@@ -557,7 +589,7 @@ if __name__ == "__main__":
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | ROBUST SL/TP Sync (fallback enabled)")
+    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | SEPARATE SL/TP Orders + Robust Sync")
     log(f"Symbols: {SYMBOLS} | Real Money Ready\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
