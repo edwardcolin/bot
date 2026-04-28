@@ -71,7 +71,6 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 def show_log():
     try:
         display_content = "\n".join(recent_logs)
-        
         win_rate = (total_wins / (total_wins + total_losses) * 100) if (total_wins + total_losses) > 0 else 0
         pnl_color = "#4ade80" if total_pnl >= 0 else "#f87171"
         pnl_sign = "+" if total_pnl >= 0 else ""
@@ -82,20 +81,11 @@ def show_log():
             <title>Kraken ICT Bot - Live Log</title>
             <style>
                 body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.4; margin: 0; }}
-                .stats-header {{ 
-                    background: #252526; border: 2px solid #3c3c3c; border-radius: 8px; 
-                    padding: 15px 20px; margin-bottom: 20px; font-size: 18px; 
-                    display: flex; flex-wrap: wrap; gap: 25px; align-items: center; 
-                }}
+                .stats-header {{ background: #252526; border: 2px solid #3c3c3c; border-radius: 8px; padding: 15px 20px; margin-bottom: 20px; font-size: 18px; display: flex; flex-wrap: wrap; gap: 25px; align-items: center; }}
                 .stat-item {{ display: flex; align-items: center; gap: 8px; }}
                 .stat-label {{ color: #888; font-size: 14px; }}
                 .pnl {{ font-weight: bold; }}
-                pre {{ 
-                    white-space: pre-wrap; word-wrap: break-word; font-size: 13px; 
-                    max-height: 78vh; overflow-y: auto;
-                    background: #252526; padding: 15px;
-                    border-radius: 6px; border: 1px solid #3c3c3c;
-                }}
+                pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 13px; max-height: 78vh; overflow-y: auto; background: #252526; padding: 15px; border-radius: 6px; border: 1px solid #3c3c3c; }}
                 .header {{ color: #569cd6; }}
             </style>
         </head>
@@ -324,7 +314,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time
-    log("🚀 Real Money Ready - Cumulative Stats + No Daily Reset + USD Win/Loss Tracking\n", to_file=True)
+    log("🚀 Real Money Ready - Cumulative Stats + Dynamic Risk + Improved Stop Distance\n", to_file=True)
 
     try:
         positions = exchange.fetch_positions()
@@ -344,6 +334,10 @@ async def main():
 
     while True:
         try:
+            # Dynamic risk calculation
+            account_balance = get_account_balance()
+            RISK_USD = account_balance * (RISK_PERCENT / 100.0)
+
             today = date.today()
             if today != current_day:
                 log_file = f"trading_log_{today}.txt"
@@ -433,9 +427,10 @@ async def main():
             if best_setup and daily_trades < MAX_TRADES_PER_DAY and (can_trade or allow_by_wiggle):
                 symbol, direction, current_price, fvg_extreme, dynamic_buffer = best_setup
 
+                # Improved minimum stop distance
                 if direction == 'bullish':
                     stop_price = fvg_extreme - dynamic_buffer
-                    min_distance = max(current_price * 0.0015, 0.00005)
+                    min_distance = max(current_price * 0.002, 0.0001, dynamic_buffer * 1.5)  # 0.2% or 2× ATR
                     if stop_price >= current_price - min_distance:
                         log(f"⚠️ [{symbol}] Skipped bad setup (stop too close to entry)", to_file=False)
                         continue
@@ -443,7 +438,7 @@ async def main():
                     await place_trade(symbol, 'buy', current_price, stop_price, tp_price, RISK_USD, best_score, best_choch_level)
                 else:
                     stop_price = fvg_extreme + dynamic_buffer
-                    min_distance = max(current_price * 0.0015, 0.00005)
+                    min_distance = max(current_price * 0.002, 0.0001, dynamic_buffer * 1.5)
                     if stop_price <= current_price + min_distance:
                         log(f"⚠️ [{symbol}] Skipped bad setup (stop too close to entry)", to_file=False)
                         continue
@@ -476,8 +471,8 @@ if __name__ == "__main__":
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | Cumulative stats enabled")
-    log(f"Symbols: {SYMBOLS} | Real Money Ready + No Daily Reset\n", to_file=True)
+    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | Cumulative stats + Improved Stop Distance")
+    log(f"Symbols: {SYMBOLS} | Real Money Ready\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
