@@ -102,10 +102,12 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 @app.route('/')
 def show_log():
     try:
+        balance_snapshot = live_balance.copy()
         display_content = "\n".join(recent_logs)
         win_rate = (total_wins / (total_wins + total_losses) * 100) if (total_wins + total_losses) > 0 else 0
         pnl_color = "#4ade80" if total_pnl >= 0 else "#f87171"
         pnl_sign = "+" if total_pnl >= 0 else ""
+        risk_usd_preview = _safe_float(balance_snapshot.get("available_usd"), 0.0) * (RISK_PERCENT / 100.0)
         active_summary = ""
         for sym, trade in active_trades.items():
             active_summary += f"<div class='trade-item'>[{sym}] {trade['side'].upper()} @ {trade['entry_price']:.4f} | SL: {trade['stop_price']:.4f} | TP: {trade['tp_price']:.4f}</div>"
@@ -144,6 +146,11 @@ def show_log():
                 <div class="stat-item"><span class="stat-label">TRADES TODAY</span><strong>{daily_trades}</strong></div>
                 <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${daily_pnl:.5f}</strong></div>
                 <div class="stat-item"><span class="stat-label">TOTAL PNL</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${total_pnl:.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">WALLET</span><strong>${balance_snapshot.get('wallet_usd', 0.0):.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">AVAILABLE</span><strong>${balance_snapshot.get('available_usd', 0.0):.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">USED</span><strong>${balance_snapshot.get('used_usd', 0.0):.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">RISK/TRADE</span><strong>${risk_usd_preview:.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">BALANCE TS</span><strong>{balance_snapshot.get('fetched_at') or '--:--:--'}</strong></div>
             </div>
             <h3 style="color:#569cd6; margin: 10px 0 5px;">Active Trades</h3>
             <div style="margin-bottom: 20px; max-height: 150px; overflow-y: auto;">
@@ -190,6 +197,13 @@ last_trade_time = None
 daily_trades = 0
 daily_pnl = 0.0
 current_day = date.today()
+live_balance = {
+    "wallet_usd": 0.0,
+    "equity_usd": 0.0,
+    "available_usd": 0.0,
+    "used_usd": 0.0,
+    "fetched_at": None,
+}
 
 def _safe_float(value, default=0.0):
     try:
@@ -278,16 +292,37 @@ def _compute_realized_pnl(symbol, trade, exit_price):
     realized = gross - fee_total
     return realized, fee_total
 
-def get_account_balance():
+def refresh_live_balance():
     try:
         balance = exchange.fetch_balance()
-        usd_bucket = balance.get('USD', {})
-        usd_free = usd_bucket.get('free')
-        if usd_free is None:
-            usd_free = balance.get('info', {}).get('marginAvailable', 0.0)
-        return max(float(usd_free or 0.0), 0.0)
+        usd_bucket = balance.get('USD', {}) or {}
+        info = balance.get('info', {}) or {}
+        wallet = (
+            _safe_float(usd_bucket.get('total'), 0.0)
+            or _safe_float(info.get('accountValue'), 0.0)
+            or _safe_float(info.get('balanceValue'), 0.0)
+        )
+        available = (
+            _safe_float(usd_bucket.get('free'), 0.0)
+            or _safe_float(info.get('marginAvailable'), 0.0)
+            or _safe_float(info.get('availableFunds'), 0.0)
+        )
+        used = _safe_float(usd_bucket.get('used'), 0.0) or max(wallet - available, 0.0)
+        equity = _safe_float(info.get('accountValue'), 0.0) or wallet
+        live_balance.update({
+            "wallet_usd": max(wallet, 0.0),
+            "equity_usd": max(equity, 0.0),
+            "available_usd": max(available, 0.0),
+            "used_usd": max(used, 0.0),
+            "fetched_at": datetime.now().strftime("%H:%M:%S"),
+        })
+        return live_balance.copy()
     except Exception:
-        return 0.0
+        return live_balance.copy()
+
+def get_account_balance():
+    snap = refresh_live_balance()
+    return max(_safe_float(snap.get("available_usd"), 0.0), 0.0)
 
 def detect_swing_highs_lows(df, strength=5):
     highs = df['high'].rolling(window=strength*2+1, center=True).max()
@@ -354,6 +389,26 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         quantity = round(quantity)
         quantity = max(int(min_amount), int(quantity))
         quantity = min(quantity, 2000)
+
+        balance_snapshot = refresh_live_balance()
+        available_usd = _safe_float(balance_snapshot.get("available_usd"), 0.0)
+        if available_usd <= 0:
+            log(f"⚠️ [{symbol}] No available balance; skipping order", to_file=True)
+            return None
+        max_affordable_contracts = int((available_usd * LEVERAGE) / max(current_price, 1e-8))
+        if max_affordable_contracts <= 0:
+            log(f"⚠️ [{symbol}] Available balance too low after leverage check; skipping", to_file=True)
+            return None
+        if quantity > max_affordable_contracts:
+            log(
+                f"⚠️ [{symbol}] Size capped by available margin: {quantity} -> {max_affordable_contracts} contracts "
+                f"(avail=${available_usd:.5f}, lev={LEVERAGE}x)",
+                to_file=True
+            )
+            quantity = max(int(min_amount), max_affordable_contracts)
+        if quantity < int(min_amount):
+            log(f"⚠️ [{symbol}] Quantity below minimum amount after balance checks; skipping", to_file=True)
+            return None
 
         # Conservative adjustment to avoid insufficientAvailableFunds
         try:
@@ -438,6 +493,7 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             "tp_price": float(tp_price),
             "quantity": float(quantity),
             "risk_usd": float(risk_usd),
+            "available_usd_at_entry": float(available_usd),
             "leverage": int(LEVERAGE),
             "order_ids": {
                 "entry_order_id": order.get('id'),
@@ -551,12 +607,20 @@ async def main():
 
     while True:
         try:
-            account_balance = get_account_balance()
+            balance_snapshot = refresh_live_balance()
+            account_balance = _safe_float(balance_snapshot.get("available_usd"), 0.0)
             RISK_USD = account_balance * (RISK_PERCENT / 100.0)
             if RISK_USD <= 0:
                 log("⚠️ No available USD margin yet; waiting...", to_file=False, to_recent=False)
                 await asyncio.sleep(20)
                 continue
+            log(
+                f"💰 Balance check | Wallet=${balance_snapshot.get('wallet_usd', 0.0):.5f} "
+                f"| Available=${balance_snapshot.get('available_usd', 0.0):.5f} "
+                f"| Risk/Trade={RISK_PERCENT:.3f}% => ${RISK_USD:.5f}",
+                to_file=False,
+                to_recent=False
+            )
 
             today = date.today()
             if today != current_day:
