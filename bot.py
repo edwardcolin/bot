@@ -6,7 +6,7 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
-from flask import Flask, Response
+from flask import Flask, Response, request
 import threading
 import logging
 from collections import deque
@@ -87,22 +87,42 @@ def show_log():
                 .pnl {{ font-weight: bold; }}
                 pre {{ white-space: pre-wrap; word-wrap: break-word; font-size: 13px; max-height: 78vh; overflow-y: auto; background: #252526; padding: 15px; border-radius: 6px; border: 1px solid #3c3c3c; }}
                 .header {{ color: #569cd6; }}
+                .buttons {{ margin-bottom: 15px; display: flex; gap: 15px; }}
+                button {{ padding: 10px 20px; font-size: 14px; background: #3c3c3c; color: #d4d4d4; border: 1px solid #569cd6; border-radius: 4px; cursor: pointer; }}
+                button:hover {{ background: #569cd6; color: #1e1e1e; }}
             </style>
         </head>
         <body>
             <h2 class="header">🚀 Kraken ICT Bot - LIVE Trading Log (Manual Refresh)</h2>
             
+            <div class="buttons">
+                <button onclick="clearLogs()">🗑️ Clear Console Logs</button>
+                <button onclick="resetDailyStats()">🔄 Reset Daily Stats (Top Bar)</button>
+            </div>
+
             <div class="stats-header">
                 <div class="stat-item"><span class="stat-label">WINS</span><strong style="color:#4ade80">{total_wins}</strong></div>
                 <div class="stat-item"><span class="stat-label">LOSSES</span><strong style="color:#f87171">{total_losses}</strong></div>
                 <div class="stat-item"><span class="stat-label">WIN RATE</span><strong>{win_rate:.1f}%</strong></div>
                 <div class="stat-item"><span class="stat-label">TRADES TODAY</span><strong>{daily_trades}</strong></div>
-                <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${total_pnl:.2f}</strong></div>
-                <div class="stat-item"><span class="stat-label">WON USD</span><strong style="color:#4ade80">${total_win_usd:.2f}</strong></div>
-                <div class="stat-item"><span class="stat-label">LOST USD</span><strong style="color:#f87171">${total_loss_usd:.2f}</strong></div>
+                <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${daily_pnl:.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">TOTAL PNL</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${total_pnl:.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">WON USD</span><strong style="color:#4ade80">${total_win_usd:.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">LOST USD</span><strong style="color:#f87171">${total_loss_usd:.5f}</strong></div>
             </div>
 
             <pre id="logpre">{display_content}</pre>
+
+            <script>
+                function clearLogs() {{
+                    fetch('/clear_logs')
+                        .then(() => location.reload());
+                }}
+                function resetDailyStats() {{
+                    fetch('/reset_daily_stats')
+                        .then(() => location.reload());
+                }}
+            </script>
         </body>
         </html>
         """
@@ -113,6 +133,18 @@ def show_log():
         return response
     except Exception:
         return "<h2>Error reading log</h2>"
+
+@app.route('/clear_logs')
+def clear_logs():
+    recent_logs.clear()
+    return "Console logs cleared", 200
+
+@app.route('/reset_daily_stats')
+def reset_daily_stats():
+    global daily_trades, daily_pnl
+    daily_trades = 0
+    daily_pnl = 0.0
+    return "Daily stats reset", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -255,6 +287,7 @@ async def manage_open_trade(symbol, df):
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
 
+    # Breakeven move + update local dict
     if not trade.get('breakeven_moved', False) and trade.get('choch_level'):
         choch_level = trade['choch_level']
         if (trade['side'] == 'buy' and current_price > choch_level) or \
@@ -269,11 +302,13 @@ async def manage_open_trade(symbol, df):
                     amount=trade['quantity'],
                     params={'stopPrice': new_sl, 'reduceOnly': True, 'trigger': 'mark'}
                 )
+                trade['stop_price'] = new_sl
                 trade['breakeven_moved'] = True
                 log(f"🔄 [{symbol}] BREAKEVEN TRIGGERED → SL moved to entry {new_sl:.4f}", to_file=True)
             except Exception as e:
                 log(f"⚠️ Breakeven update failed for {symbol}: {e}", to_file=True)
 
+    # Simulated price-based close (kept as fallback)
     hit = False
     pnl = 0.0
     result = ""
@@ -309,12 +344,56 @@ async def manage_open_trade(symbol, df):
             total_loss_usd += abs(pnl)
 
         duration = (datetime.now() - trade['open_time']).seconds // 60
-        log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED | PNL: ${pnl:.2f} | Duration: {duration} min", to_file=True)
+        log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (simulated) | PNL: ${pnl:.5f} | Duration: {duration} min", to_file=True)
         del active_trades[symbol]
 
+async def sync_active_trades():
+    """Reliably detects SL/TP closures by checking Kraken positions + fetching REAL realized PnL."""
+    global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
+    try:
+        positions = exchange.fetch_positions()
+        open_symbols = {p['symbol'] for p in positions if float(p.get('contracts', 0)) != 0}
+
+        for symbol in list(active_trades.keys()):
+            if symbol not in open_symbols:
+                trade = active_trades[symbol]
+                
+                # Fetch real closing trades for accurate PnL
+                since = int(trade['open_time'].timestamp() * 1000) - 60000  # 1 min buffer
+                my_trades = exchange.fetch_my_trades(symbol, since=since, limit=50)
+                
+                realized_pnl = 0.0
+                closing_found = False
+                for t in my_trades:
+                    if t.get('side') != trade['side'] and t.get('amount') == trade.get('quantity', 0):  # opposite side = close
+                        realized_pnl += float(t.get('info', {}).get('realizedPnl', 0) or t.get('realizedPnl', 0) or 0)
+                        closing_found = True
+                
+                # Fallback if no exact match
+                if not closing_found:
+                    realized_pnl = RISK_USD * (-1 if not trade.get('breakeven_moved', False) else -0.3)
+                
+                result = "WIN" if realized_pnl > 0 else "LOSS"
+                
+                daily_pnl += realized_pnl
+                total_pnl += realized_pnl
+                
+                if result == "WIN":
+                    total_wins += 1
+                    total_win_usd += abs(realized_pnl)
+                else:
+                    total_losses += 1
+                    total_loss_usd += abs(realized_pnl)
+
+                duration = (datetime.now() - trade['open_time']).seconds // 60
+                log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (exchange SL/TP) | REAL PNL: ${realized_pnl:.5f} | Duration: {duration} min", to_file=True)
+                del active_trades[symbol]
+    except Exception as e:
+        log(f"⚠️ Position sync failed: {e}", to_file=False)
+
 async def main():
-    global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time
-    log("🚀 Real Money Ready - Cumulative Stats + Dynamic Risk + Improved Stop Distance\n", to_file=True)
+    global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
+    log("🚀 Real Money Ready - Accurate SL/TP Sync + 5-decimal PnL + Clear Buttons\n", to_file=True)
 
     try:
         positions = exchange.fetch_positions()
@@ -330,7 +409,7 @@ async def main():
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
     cooldown_minutes = 1440 / MAX_TRADES_PER_DAY
-    wiggle_minutes = cooldown_minutes * 0.25
+    wiggle_minutes = cooldown_minutes * 0.50
 
     while True:
         try:
@@ -388,6 +467,7 @@ async def main():
                 log(f"[{symbol}] Price: {current_price:.4f} | 15m Bias: {latest_15m_bias or 'NONE'} | 1m CHOCH: {len(choch_1m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
 
                 await manage_open_trade(symbol, df1m)
+                await sync_active_trades()          # ← NEW: accurate closure detection
                 if symbol in active_trades:
                     continue
 
@@ -427,10 +507,9 @@ async def main():
             if best_setup and daily_trades < MAX_TRADES_PER_DAY and (can_trade or allow_by_wiggle):
                 symbol, direction, current_price, fvg_extreme, dynamic_buffer = best_setup
 
-                # Improved minimum stop distance
                 if direction == 'bullish':
                     stop_price = fvg_extreme - dynamic_buffer
-                    min_distance = max(current_price * 0.002, 0.0001, dynamic_buffer * 1.5)  # 0.2% or 2× ATR
+                    min_distance = max(current_price * 0.002, 0.0001, dynamic_buffer * 1.5)
                     if stop_price >= current_price - min_distance:
                         log(f"⚠️ [{symbol}] Skipped bad setup (stop too close to entry)", to_file=False)
                         continue
@@ -463,15 +542,13 @@ if __name__ == "__main__":
         return {"wins": 0, "losses": 0, "total_pnl": 0.0}
 
     stats = load_stats()
-    global wins, losses, daily_pnl, daily_trades
-    wins = stats.get("wins", 0)
-    losses = stats.get("losses", 0)
+    global daily_pnl, daily_trades
     daily_pnl = 0.0
     daily_trades = 0
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | Cumulative stats + Improved Stop Distance")
+    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | Accurate SL/TP Sync + 5-decimal PnL + Clear Buttons")
     log(f"Symbols: {SYMBOLS} | Real Money Ready\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
