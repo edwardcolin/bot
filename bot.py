@@ -28,6 +28,7 @@ MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 9)
 MAX_DAILY_LOSS_USD = config.get("max_daily_loss_usd", 5.0)
 RR_RATIO = config.get("rr_ratio", 3.7)
 USE_TESTNET = config.get("use_testnet", True)
+PRECHECK_DISABLE_AFTER = int(config.get("precheck_disable_after", 3))
 
 exchange = ccxt.krakenfutures({
     'apiKey': os.getenv('KRAKEN_API_KEY'),
@@ -151,6 +152,7 @@ def show_log():
                 <div class="stat-item"><span class="stat-label">USED</span><strong>${balance_snapshot.get('used_usd', 0.0):.5f}</strong></div>
                 <div class="stat-item"><span class="stat-label">RISK/TRADE</span><strong>${risk_usd_preview:.5f}</strong></div>
                 <div class="stat-item"><span class="stat-label">BALANCE TS</span><strong>{balance_snapshot.get('fetched_at') or '--:--:--'}</strong></div>
+                <div class="stat-item"><span class="stat-label">DISABLED SYMBOLS</span><strong>{len(disabled_symbols)}</strong></div>
             </div>
             <h3 style="color:#569cd6; margin: 10px 0 5px;">Active Trades</h3>
             <div style="margin-bottom: 20px; max-height: 150px; overflow-y: auto;">
@@ -204,6 +206,8 @@ live_balance = {
     "used_usd": 0.0,
     "fetched_at": None,
 }
+symbol_precheck_failures = {}
+disabled_symbols = {}
 
 def _safe_float(value, default=0.0):
     try:
@@ -330,6 +334,53 @@ def _estimate_initial_margin_usd(market, contracts, entry_price, leverage):
         notional = contracts * entry_price
     # Keep a small buffer for fees/slippage.
     return (notional / leverage) * 1.05
+
+def precheck_symbol_tradeability(symbol, current_price, stop_price, risk_usd):
+    market = exchange.market(symbol)
+    min_amount = _safe_float(market.get('limits', {}).get('amount', {}).get('min'), 1.0) or 1.0
+    precision_amount = market.get('precision', {}).get('amount')
+    step = 1.0
+    if precision_amount is not None:
+        try:
+            step = 10 ** (-int(precision_amount))
+        except Exception:
+            step = 1.0
+    min_qty = max(min_amount, step)
+    available_usd = _safe_float(live_balance.get("available_usd"), 0.0)
+    min_lot_risk = _estimate_stop_loss_usd(market, min_qty, current_price, stop_price)
+    min_lot_margin = _estimate_initial_margin_usd(market, min_qty, current_price, LEVERAGE)
+
+    if available_usd <= 0:
+        return {
+            "ok": False,
+            "reason": "NO_AVAILABLE_BALANCE",
+            "available_usd": available_usd,
+            "min_lot_risk": min_lot_risk,
+            "min_lot_margin": min_lot_margin,
+        }
+    if min_lot_margin > available_usd:
+        return {
+            "ok": False,
+            "reason": "MIN_LOT_MARGIN_EXCEEDS_AVAILABLE",
+            "available_usd": available_usd,
+            "min_lot_risk": min_lot_risk,
+            "min_lot_margin": min_lot_margin,
+        }
+    if min_lot_risk > risk_usd:
+        return {
+            "ok": False,
+            "reason": "MIN_LOT_RISK_EXCEEDS_TARGET",
+            "available_usd": available_usd,
+            "min_lot_risk": min_lot_risk,
+            "min_lot_margin": min_lot_margin,
+        }
+    return {
+        "ok": True,
+        "reason": "OK",
+        "available_usd": available_usd,
+        "min_lot_risk": min_lot_risk,
+        "min_lot_margin": min_lot_margin,
+    }
 
 def refresh_live_balance():
     try:
@@ -716,6 +767,8 @@ async def main():
                 current_day = today
                 daily_setups.clear()
                 last_trade_time = None
+                symbol_precheck_failures.clear()
+                disabled_symbols.clear()
 
             if daily_pnl <= -MAX_DAILY_LOSS_USD:
                 log("🚫 Daily max loss reached. Paused.", to_file=True)
@@ -733,6 +786,8 @@ async def main():
             best_setup = None
 
             for symbol in SYMBOLS:
+                if symbol in disabled_symbols:
+                    continue
                 df1m = await fetch_latest_candles(symbol, TIMEFRAME)
                 if len(df1m) < 100:
                     continue
@@ -781,11 +836,45 @@ async def main():
                 if s['direction'] == 'bullish':
                     stop_price = s['fvg_extreme'] - buffer
                     tp_price = s['current_price'] + (s['current_price'] - stop_price) * RR_RATIO
-                    created_order = await place_trade(s['symbol'], 'buy', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
+                    precheck = precheck_symbol_tradeability(s['symbol'], s['current_price'], stop_price, RISK_USD)
+                    if precheck.get("ok"):
+                        symbol_precheck_failures.pop(s['symbol'], None)
+                        created_order = await place_trade(s['symbol'], 'buy', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
+                    else:
+                        fail_count = symbol_precheck_failures.get(s['symbol'], 0) + 1
+                        symbol_precheck_failures[s['symbol']] = fail_count
+                        log(
+                            f"🧪 Precheck fail [{s['symbol']}] {precheck.get('reason')} "
+                            f"| min_lot_risk=${precheck.get('min_lot_risk', 0.0):.5f} "
+                            f"| min_lot_margin=${precheck.get('min_lot_margin', 0.0):.5f} "
+                            f"| available=${precheck.get('available_usd', 0.0):.5f} "
+                            f"| fail_count={fail_count}/{PRECHECK_DISABLE_AFTER}",
+                            to_file=True
+                        )
+                        if fail_count >= PRECHECK_DISABLE_AFTER:
+                            disabled_symbols[s['symbol']] = precheck.get('reason')
+                            log(f"🚫 Disabling {s['symbol']} from tracking (precheck failures: {precheck.get('reason')})", to_file=True)
                 else:
                     stop_price = s['fvg_extreme'] + buffer
                     tp_price = s['current_price'] - (stop_price - s['current_price']) * RR_RATIO
-                    created_order = await place_trade(s['symbol'], 'sell', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
+                    precheck = precheck_symbol_tradeability(s['symbol'], s['current_price'], stop_price, RISK_USD)
+                    if precheck.get("ok"):
+                        symbol_precheck_failures.pop(s['symbol'], None)
+                        created_order = await place_trade(s['symbol'], 'sell', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
+                    else:
+                        fail_count = symbol_precheck_failures.get(s['symbol'], 0) + 1
+                        symbol_precheck_failures[s['symbol']] = fail_count
+                        log(
+                            f"🧪 Precheck fail [{s['symbol']}] {precheck.get('reason')} "
+                            f"| min_lot_risk=${precheck.get('min_lot_risk', 0.0):.5f} "
+                            f"| min_lot_margin=${precheck.get('min_lot_margin', 0.0):.5f} "
+                            f"| available=${precheck.get('available_usd', 0.0):.5f} "
+                            f"| fail_count={fail_count}/{PRECHECK_DISABLE_AFTER}",
+                            to_file=True
+                        )
+                        if fail_count >= PRECHECK_DISABLE_AFTER:
+                            disabled_symbols[s['symbol']] = precheck.get('reason')
+                            log(f"🚫 Disabling {s['symbol']} from tracking (precheck failures: {precheck.get('reason')})", to_file=True)
                 if created_order:
                     daily_trades += 1
                     last_trade_time = datetime.now()
