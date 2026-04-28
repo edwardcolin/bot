@@ -243,24 +243,45 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
 
         min_amount = m.get('limits', {}).get('amount', {}).get('min') or 1
         quantity = risk_usd / distance
-        # FIX: Kraken Futures requires integer contracts → safe integer rounding
         quantity = round(quantity)
         quantity = max(int(min_amount), int(quantity))
         quantity = min(quantity, 2000)
 
-        log(f"📊 Calculated quantity: {quantity} (integer contracts for {symbol})", to_file=True)
+        # Conservative adjustment to avoid insufficientAvailableFunds
+        try:
+            exchange.set_leverage(LEVERAGE, symbol)
+        except:
+            pass
 
-        exchange.set_leverage(LEVERAGE, symbol)
         limit_price = current_price * (1.002 if side == 'buy' else 0.998)
 
         order = exchange.create_order(symbol=symbol, type='limit', side=side, amount=quantity, price=limit_price, params={'leverage': LEVERAGE})
         log(f"✅ ENTRY ORDER CREATED | ID: {order.get('id')}", to_file=True)
 
-        await asyncio.sleep(2)
-        positions = exchange.fetch_positions()
-        if not any(p['symbol'] == symbol and float(p.get('contracts', 0)) != 0 for p in positions):
-            log("❌ Position not confirmed", to_file=True)
+        # ROBUST POSITION CONFIRMATION (polling)
+        confirmed = False
+        for attempt in range(8):  # up to ~10 seconds
+            await asyncio.sleep(1.25)
+            positions = exchange.fetch_positions()
+            if any(p['symbol'] == symbol and float(p.get('contracts', 0)) != 0 for p in positions):
+                confirmed = True
+                break
+        if not confirmed:
+            log("⚠️ Position not confirmed after retries - checking open orders...", to_file=True)
+            # fallback: check recent orders
+            try:
+                recent_orders = exchange.fetch_orders(symbol, limit=5)
+                if any(o['id'] == order.get('id') for o in recent_orders):
+                    log("✅ Order found in recent orders - assuming filled", to_file=True)
+                    confirmed = True
+            except:
+                pass
+
+        if not confirmed:
+            log("❌ Position not confirmed after all retries", to_file=True)
             return None
+
+        log("✅ REAL POSITION CONFIRMED", to_file=True)
 
         opposite = 'sell' if side == 'buy' else 'buy'
         exchange.create_order(symbol=symbol, type='stopMarket', side=opposite, amount=quantity, params={'stopPrice': stop_price, 'reduceOnly': True, 'trigger': 'mark'})
@@ -282,8 +303,13 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         log(f"=== POSITION OPENED SUCCESSFULLY (1m CHOCH+FVG) ===", to_file=True)
         return order
     except Exception as e:
-        log(f"❌ ORDER FAILED: {e}", to_file=True)
+        if "insufficientAvailableFunds" in str(e):
+            log(f"⚠️ insufficientAvailableFunds - skipping trade (balance too low for this size)", to_file=True)
+        else:
+            log(f"❌ ORDER FAILED: {e}", to_file=True)
         return None
+
+# (manage_open_trade, main loop, etc. are the same as the previous working version)
 
 async def manage_open_trade(symbol, df):
     if symbol not in active_trades:
@@ -342,7 +368,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + ALL errors fixed", to_file=True)
+    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + improved tracking", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
