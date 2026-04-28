@@ -62,7 +62,7 @@ def log(message, to_file=True, to_recent=True):
         except Exception as e:
             print(f"[LOG ERROR] {e}")
 
-# ====================== ROBUST MARKET LOAD (now after log is defined) ======================
+# ====================== ROBUST MARKET LOAD ======================
 def load_markets_robust():
     for attempt in range(3):
         try:
@@ -189,7 +189,6 @@ def detect_swing_highs_lows(df, strength=5):
     return df
 
 def detect_choch(df):
-    """1m-only CHOCH with 90-minute pattern recognition (exactly as you described)"""
     if len(df) < 100:
         return []
     recent_df = df.iloc[-90:].copy()
@@ -200,12 +199,10 @@ def detect_choch(df):
         recent_lows = recent_df['swing_low'].iloc[i-20:i].dropna()
         if len(recent_highs) < 3 or len(recent_lows) < 3:
             continue
-        # Bullish CHOCH
         if (recent_df['close'].iloc[i] > recent_highs.iloc[-1] and 
             recent_df['close'].iloc[i-1] <= recent_highs.iloc[-1] and
             recent_highs.iloc[-1] > recent_highs.iloc[-2]):
             signals.append(('bullish', len(df)-90+i, recent_highs.iloc[-1]))
-        # Bearish CHOCH
         if (recent_df['close'].iloc[i] < recent_lows.iloc[-1] and 
             recent_df['close'].iloc[i-1] >= recent_lows.iloc[-1] and
             recent_lows.iloc[-1] < recent_lows.iloc[-2]):
@@ -215,13 +212,15 @@ def detect_choch(df):
 def detect_fvg(df):
     fvgs = []
     for i in range(3, len(df)):
-        c1, c2, c3 = df.iloc[i-3:i]
+        c1 = df.iloc[i-3]
+        c2 = df.iloc[i-2]
+        c3 = df.iloc[i-1]
         # Bullish FVG
-        if (c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and c1['high'] < c3['low']):
+        if c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and c1['high'] < c3['low']:
             midpoint = (c1['high'] + c3['low']) / 2
             fvgs.append({'type': 'bullish', 'midpoint': midpoint, 'extreme': c3['low'], 'idx': i, 'candle_idx': i-1})
         # Bearish FVG
-        if (c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and c1['low'] > c3['high']):
+        if c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and c1['low'] > c3['high']:
             midpoint = (c1['low'] + c3['high']) / 2
             fvgs.append({'type': 'bearish', 'midpoint': midpoint, 'extreme': c3['high'], 'idx': i, 'candle_idx': i-1})
     return fvgs
@@ -340,7 +339,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + ALL errors fixed", to_file=True)
+    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + NO UNPACK ERRORS", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
