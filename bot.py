@@ -11,6 +11,7 @@ import threading
 import logging
 from collections import deque
 import time
+from uuid import uuid4
 
 load_dotenv()
 
@@ -38,6 +39,7 @@ exchange.set_sandbox_mode(USE_TESTNET)
 
 # ====================== LOGGING SETUP ======================
 log_file = f"trading_log_{date.today()}.txt"
+audit_file = f"trade_audit_{date.today()}.jsonl"
 recent_logs = deque(maxlen=2000)
 daily_setups = deque(maxlen=300)
 
@@ -61,6 +63,20 @@ def log(message, to_file=True, to_recent=True):
                 os.fsync(f.fileno())
         except Exception as e:
             print(f"[LOG ERROR] {e}")
+
+def log_trade_audit(event, payload):
+    record = {
+        "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        "event": event,
+        "payload": payload,
+    }
+    try:
+        with open(audit_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        log(f"⚠️ Audit log write failed: {e}", to_file=False, to_recent=False)
 
 # ====================== ROBUST MARKET LOAD ======================
 def load_markets_robust():
@@ -122,6 +138,8 @@ def show_log():
             <div class="stats-header">
                 <div class="stat-item"><span class="stat-label">WINS</span><strong style="color:#4ade80">{total_wins}</strong></div>
                 <div class="stat-item"><span class="stat-label">LOSSES</span><strong style="color:#f87171">{total_losses}</strong></div>
+                <div class="stat-item"><span class="stat-label">WIN AMOUNT</span><strong style="color:#4ade80">${total_win_usd:.5f}</strong></div>
+                <div class="stat-item"><span class="stat-label">LOSS AMOUNT</span><strong style="color:#f87171">${total_loss_usd:.5f}</strong></div>
                 <div class="stat-item"><span class="stat-label">WIN RATE</span><strong>{win_rate:.1f}%</strong></div>
                 <div class="stat-item"><span class="stat-label">TRADES TODAY</span><strong>{daily_trades}</strong></div>
                 <div class="stat-item"><span class="stat-label">PNL TODAY</span><strong class="pnl" style="color:{pnl_color}">{pnl_sign}${daily_pnl:.5f}</strong></div>
@@ -173,13 +191,103 @@ daily_trades = 0
 daily_pnl = 0.0
 current_day = date.today()
 
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def _extract_fee_cost(trade):
+    fee = trade.get('fee') or {}
+    fee_cost = _safe_float(fee.get('cost'), 0.0)
+    if fee_cost != 0:
+        return abs(fee_cost)
+    info = trade.get('info') or {}
+    for key in ('fee', 'fees', 'execFee', 'commission'):
+        value = info.get(key)
+        parsed = _safe_float(value, 0.0)
+        if parsed != 0:
+            return abs(parsed)
+    return 0.0
+
+def _fetch_order_safe(order_id, symbol):
+    if not order_id:
+        return None
+    try:
+        return exchange.fetch_order(order_id, symbol)
+    except Exception:
+        return None
+
+def _determine_close_reason_and_price(symbol, trade):
+    tp_order = _fetch_order_safe(trade.get('tp_order_id'), symbol)
+    sl_order = _fetch_order_safe(trade.get('sl_order_id'), symbol)
+
+    close_reason = "MANUAL_OR_UNKNOWN"
+    close_order = None
+    if tp_order and tp_order.get('status') == 'closed':
+        close_reason = "TP_HIT"
+        close_order = tp_order
+    elif sl_order and sl_order.get('status') == 'closed':
+        close_reason = "SL_HIT"
+        close_order = sl_order
+    elif tp_order and _safe_float(tp_order.get('filled'), 0.0) > 0:
+        close_reason = "TP_PARTIAL_OR_FILLED"
+        close_order = tp_order
+    elif sl_order and _safe_float(sl_order.get('filled'), 0.0) > 0:
+        close_reason = "SL_PARTIAL_OR_FILLED"
+        close_order = sl_order
+
+    exit_price = None
+    if close_order:
+        exit_price = (
+            _safe_float(close_order.get('average'), 0.0)
+            or _safe_float(close_order.get('price'), 0.0)
+            or _safe_float((close_order.get('info') or {}).get('stopPrice'), 0.0)
+            or _safe_float((close_order.get('info') or {}).get('triggerPrice'), 0.0)
+            or _safe_float((close_order.get('info') or {}).get('limitPrice'), 0.0)
+        )
+        if exit_price == 0:
+            exit_price = None
+    if exit_price is None:
+        exit_price = _safe_float(trade.get('tp_price' if close_reason.startswith('TP') else 'stop_price'), 0.0)
+    return close_reason, exit_price
+
+def _compute_realized_pnl(symbol, trade, exit_price):
+    entry_price = _safe_float(trade.get('entry_fill_price'), 0.0) or _safe_float(trade.get('entry_price'), 0.0)
+    qty = _safe_float(trade.get('quantity'), 0.0)
+    side = trade.get('side')
+    if qty <= 0 or entry_price <= 0 or exit_price <= 0:
+        return 0.0, 0.0
+
+    gross = (exit_price - entry_price) * qty if side == 'buy' else (entry_price - exit_price) * qty
+    fee_total = 0.0
+    try:
+        trades = exchange.fetch_my_trades(symbol, limit=100)
+        tracked_ids = {
+            trade.get('entry_order_id'),
+            trade.get('sl_order_id'),
+            trade.get('tp_order_id'),
+        }
+        for t in trades:
+            if t.get('order') in tracked_ids:
+                fee_total += _extract_fee_cost(t)
+    except Exception:
+        pass
+    realized = gross - fee_total
+    return realized, fee_total
+
 def get_account_balance():
     try:
         balance = exchange.fetch_balance()
-        usd_free = float(balance.get('USD', {}).get('free', 0) or balance.get('info', {}).get('marginAvailable', 100.0))
-        return max(usd_free, 100.0)
-    except:
-        return 100.0
+        usd_bucket = balance.get('USD', {})
+        usd_free = usd_bucket.get('free')
+        if usd_free is None:
+            usd_free = balance.get('info', {}).get('marginAvailable', 0.0)
+        return max(float(usd_free or 0.0), 0.0)
+    except Exception:
+        return 0.0
 
 def detect_swing_highs_lows(df, strength=5):
     highs = df['high'].rolling(window=strength*2+1, center=True).max()
@@ -267,12 +375,12 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
                 confirmed = True
                 break
         if not confirmed:
-            log("⚠️ Position not confirmed after retries - checking open orders...", to_file=True)
-            # fallback: check recent orders
+            log("⚠️ Position not confirmed after retries - checking order status...", to_file=True)
             try:
-                recent_orders = exchange.fetch_orders(symbol, limit=5)
-                if any(o['id'] == order.get('id') for o in recent_orders):
-                    log("✅ Order found in recent orders - assuming filled", to_file=True)
+                fetched = exchange.fetch_order(order.get('id'), symbol)
+                status = (fetched or {}).get('status')
+                if status == 'closed':
+                    log("✅ Entry order closed on exchange", to_file=True)
                     confirmed = True
             except:
                 pass
@@ -284,12 +392,26 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         log("✅ REAL POSITION CONFIRMED", to_file=True)
 
         opposite = 'sell' if side == 'buy' else 'buy'
-        exchange.create_order(symbol=symbol, type='stopMarket', side=opposite, amount=quantity, params={'stopPrice': stop_price, 'reduceOnly': True, 'trigger': 'mark'})
-        log(f"✅ SL placed @ {stop_price:.4f} (comfortably outside FVG)", to_file=True)
-        exchange.create_order(symbol=symbol, type='takeProfit', side=opposite, amount=quantity, price=tp_price, params={'reduceOnly': True, 'trigger': 'mark'})
-        log(f"✅ TP placed @ {tp_price:.4f} ({RR_RATIO:.1f}R)", to_file=True)
+        sl_order = exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side=opposite,
+            amount=quantity,
+            params={'stopLossPrice': stop_price, 'reduceOnly': True, 'triggerSignal': 'mark'}
+        )
+        log(f"✅ SL placed @ {stop_price:.4f} (reduceOnly, mark trigger)", to_file=True)
+        tp_order = exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side=opposite,
+            amount=quantity,
+            params={'takeProfitPrice': tp_price, 'reduceOnly': True, 'triggerSignal': 'mark'}
+        )
+        log(f"✅ TP placed @ {tp_price:.4f} ({RR_RATIO:.1f}R, reduceOnly, mark trigger)", to_file=True)
 
+        trade_id = str(uuid4())
         active_trades[symbol] = {
+            'trade_id': trade_id,
             'side': side,
             'entry_price': float(current_price),
             'stop_price': float(stop_price),
@@ -298,8 +420,31 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             'open_time': datetime.now(),
             'choch_level': float(choch_level),
             'fvg_extreme': float(fvg_extreme),
-            'breakeven_moved': False
+            'breakeven_moved': False,
+            'entry_order_id': order.get('id'),
+            'sl_order_id': sl_order.get('id'),
+            'tp_order_id': tp_order.get('id'),
+            'entry_fill_price': _safe_float(order.get('average'), float(current_price)),
+            'entry_filled': _safe_float(order.get('filled'), float(quantity))
         }
+        log_trade_audit("trade_opened", {
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "side": side,
+            "score": float(score),
+            "entry_price": float(current_price),
+            "entry_fill_price": _safe_float(order.get('average'), float(current_price)),
+            "stop_price": float(stop_price),
+            "tp_price": float(tp_price),
+            "quantity": float(quantity),
+            "risk_usd": float(risk_usd),
+            "leverage": int(LEVERAGE),
+            "order_ids": {
+                "entry_order_id": order.get('id'),
+                "sl_order_id": sl_order.get('id'),
+                "tp_order_id": tp_order.get('id'),
+            },
+        })
         log(f"=== POSITION OPENED SUCCESSFULLY (1m CHOCH+FVG) ===", to_file=True)
         return order
     except Exception as e:
@@ -324,50 +469,79 @@ async def manage_open_trade(symbol, df):
             try:
                 new_sl = trade['entry_price']
                 side_for_sl = 'sell' if trade['side'] == 'buy' else 'buy'
-                exchange.create_order(symbol=symbol, type='stopMarket', side=side_for_sl, amount=trade['quantity'],
-                                      params={'stopPrice': new_sl, 'reduceOnly': True, 'trigger': 'mark'})
+                if trade.get('sl_order_id'):
+                    exchange.cancel_order(trade.get('sl_order_id'), symbol)
+                be_sl_order = exchange.create_order(
+                    symbol=symbol,
+                    type='market',
+                    side=side_for_sl,
+                    amount=trade['quantity'],
+                    params={'stopLossPrice': new_sl, 'reduceOnly': True, 'triggerSignal': 'mark'}
+                )
                 trade['stop_price'] = new_sl
                 trade['breakeven_moved'] = True
+                trade['sl_order_id'] = (be_sl_order or {}).get('id')
+                log_trade_audit("breakeven_moved", {
+                    "trade_id": trade.get('trade_id'),
+                    "symbol": symbol,
+                    "new_stop_price": float(new_sl),
+                    "new_sl_order_id": trade.get('sl_order_id'),
+                    "side": trade.get('side'),
+                })
                 log(f"🔄 [{symbol}] BREAKEVEN TRIGGERED (BOS of FVG candle)", to_file=True)
             except Exception as e:
                 log(f"⚠️ Breakeven failed: {e}", to_file=True)
 
-    hit = False
-    pnl = 0.0
-    result = ""
-    if trade['side'] == 'sell':
-        if current_price >= trade['stop_price']:
-            pnl = RISK_USD * -1
-            result = "LOSS"
-            hit = True
-        elif current_price <= trade['tp_price']:
-            pnl = RISK_USD * RR_RATIO
-            result = "WIN"
-            hit = True
-    else:
-        if current_price <= trade['stop_price']:
-            pnl = RISK_USD * -1
-            result = "LOSS"
-            hit = True
-        elif current_price >= trade['tp_price']:
-            pnl = RISK_USD * RR_RATIO
-            result = "WIN"
-            hit = True
-    if hit:
+    try:
+        positions = exchange.fetch_positions([symbol])
+        has_position = any(
+            p.get('symbol') == symbol and abs(float(p.get('contracts', 0) or 0)) > 0
+            for p in positions
+        )
+    except Exception as e:
+        log(f"⚠️ Could not fetch positions for reconciliation ({symbol}): {e}", to_file=True)
+        return
+
+    if not has_position:
         global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
+        close_reason, exit_price = _determine_close_reason_and_price(symbol, trade)
+        pnl, fee_total = _compute_realized_pnl(symbol, trade, exit_price)
         daily_pnl += pnl
         total_pnl += pnl
-        if result == "WIN":
+        if pnl >= 0:
             total_wins += 1
             total_win_usd += abs(pnl)
+            result = "WIN"
         else:
             total_losses += 1
             total_loss_usd += abs(pnl)
+            result = "LOSS"
+        log_trade_audit("trade_closed", {
+            "trade_id": trade.get('trade_id'),
+            "symbol": symbol,
+            "side": trade.get('side'),
+            "result": result,
+            "close_reason": close_reason,
+            "entry_price": _safe_float(trade.get('entry_fill_price') or trade.get('entry_price')),
+            "exit_price": float(exit_price),
+            "quantity": _safe_float(trade.get('quantity')),
+            "fees_usd": float(fee_total),
+            "realized_pnl_usd": float(pnl),
+            "order_ids": {
+                "entry_order_id": trade.get('entry_order_id'),
+                "sl_order_id": trade.get('sl_order_id'),
+                "tp_order_id": trade.get('tp_order_id'),
+            },
+            "duration_seconds": max((datetime.now() - trade.get('open_time', datetime.now())).total_seconds(), 0.0),
+        })
         del active_trades[symbol]
-        log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (simulated)", to_file=True)
+        log(
+            f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED ({close_reason}) | Exit @{exit_price:.4f} | Fees ${fee_total:.4f} | PnL ${pnl:.4f}",
+            to_file=True
+        )
 
 async def main():
-    global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
+    global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, audit_file, last_trade_time, RISK_USD
     log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + improved tracking", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
@@ -379,10 +553,15 @@ async def main():
         try:
             account_balance = get_account_balance()
             RISK_USD = account_balance * (RISK_PERCENT / 100.0)
+            if RISK_USD <= 0:
+                log("⚠️ No available USD margin yet; waiting...", to_file=False, to_recent=False)
+                await asyncio.sleep(20)
+                continue
 
             today = date.today()
             if today != current_day:
                 log_file = f"trading_log_{today}.txt"
+                audit_file = f"trade_audit_{today}.jsonl"
                 daily_trades = 0
                 daily_pnl = 0.0
                 current_day = today
@@ -446,19 +625,21 @@ async def main():
 
                 await manage_open_trade(symbol, df1m)
 
-            if best_setup and daily_trades < MAX_TRADES_PER_DAY:
+            if best_setup and daily_trades < MAX_TRADES_PER_DAY and best_setup['symbol'] not in active_trades:
                 s = best_setup
                 buffer = 0.0005 * s['current_price']
+                created_order = None
                 if s['direction'] == 'bullish':
                     stop_price = s['fvg_extreme'] - buffer
                     tp_price = s['current_price'] + (s['current_price'] - stop_price) * RR_RATIO
-                    await place_trade(s['symbol'], 'buy', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
+                    created_order = await place_trade(s['symbol'], 'buy', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
                 else:
                     stop_price = s['fvg_extreme'] + buffer
                     tp_price = s['current_price'] - (stop_price - s['current_price']) * RR_RATIO
-                    await place_trade(s['symbol'], 'sell', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
-                daily_trades += 1
-                last_trade_time = datetime.now()
+                    created_order = await place_trade(s['symbol'], 'sell', s['current_price'], stop_price, tp_price, RISK_USD, s['score'], s['choch_level'], s['fvg_extreme'])
+                if created_order:
+                    daily_trades += 1
+                    last_trade_time = datetime.now()
 
             await asyncio.sleep(25)
         except Exception as e:
