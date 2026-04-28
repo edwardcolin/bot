@@ -215,11 +215,9 @@ def detect_fvg(df):
         c1 = df.iloc[i-3]
         c2 = df.iloc[i-2]
         c3 = df.iloc[i-1]
-        # Bullish FVG
         if c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and c1['high'] < c3['low']:
             midpoint = (c1['high'] + c3['low']) / 2
             fvgs.append({'type': 'bullish', 'midpoint': midpoint, 'extreme': c3['low'], 'idx': i, 'candle_idx': i-1})
-        # Bearish FVG
         if c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and c1['low'] > c3['high']:
             midpoint = (c1['low'] + c3['high']) / 2
             fvgs.append({'type': 'bearish', 'midpoint': midpoint, 'extreme': c3['high'], 'idx': i, 'candle_idx': i-1})
@@ -242,10 +240,15 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
         distance = abs(current_price - stop_price)
         if distance <= 0:
             return None
-        min_amount = m.get('limits', {}).get('amount', {}).get('min') or 0.001
+
+        min_amount = m.get('limits', {}).get('amount', {}).get('min') or 1
         quantity = risk_usd / distance
-        quantity = max(min_amount, round(quantity, m['precision']['amount'] or 4))
+        # FIX: Kraken Futures requires integer contracts → safe integer rounding
+        quantity = round(quantity)
+        quantity = max(int(min_amount), int(quantity))
         quantity = min(quantity, 2000)
+
+        log(f"📊 Calculated quantity: {quantity} (integer contracts for {symbol})", to_file=True)
 
         exchange.set_leverage(LEVERAGE, symbol)
         limit_price = current_price * (1.002 if side == 'buy' else 0.998)
@@ -339,7 +342,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + NO UNPACK ERRORS", to_file=True)
+    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + ALL errors fixed", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
