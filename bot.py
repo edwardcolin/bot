@@ -158,6 +158,8 @@ def show_log():
             <div style="margin-bottom: 20px; max-height: 150px; overflow-y: auto;">
                 {active_summary or '<em style="color:#888;">No active trades</em>'}
             </div>
+            <h3 style="color:#569cd6; margin: 10px 0 5px;">Diagnostics (1m)</h3>
+            <pre style="max-height: 140px; margin-bottom: 20px;">{latest_diagnostics}</pre>
             <pre id="logpre">{display_content}</pre>
             <script>
                 let autoRefreshInterval = null;
@@ -208,6 +210,7 @@ live_balance = {
 }
 symbol_precheck_failures = {}
 disabled_symbols = {}
+latest_diagnostics = "No diagnostics yet."
 
 def _safe_float(value, default=0.0):
     try:
@@ -733,13 +736,14 @@ async def manage_open_trade(symbol, df):
         )
 
 async def main():
-    global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, audit_file, last_trade_time, RISK_USD
+    global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, audit_file, last_trade_time, RISK_USD, latest_diagnostics
     log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + improved tracking", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
     cooldown_minutes = 1440 / MAX_TRADES_PER_DAY
     wiggle_minutes = cooldown_minutes * 0.25
+    last_diag_minute = None
 
     while True:
         try:
@@ -784,18 +788,23 @@ async def main():
                 in_warmup = False
 
             best_setup = None
+            diagnostics = []
 
             for symbol in SYMBOLS:
                 if symbol in disabled_symbols:
+                    diagnostics.append(f"{symbol}:DISABLED({disabled_symbols.get(symbol)})")
                     continue
                 df1m = await fetch_latest_candles(symbol, TIMEFRAME)
                 if len(df1m) < 100:
+                    diagnostics.append(f"{symbol}:candles<{100}")
                     continue
 
                 choch_1m = detect_choch(df1m)
                 fvg_1m = detect_fvg(df1m)
                 current_price = df1m['close'].iloc[-1]
                 latest_choch_idx = choch_1m[-1][1] if choch_1m else -1
+                considered_fvgs = 0
+                confirmed_fvgs = 0
 
                 for fvg in fvg_1m[-20:]:
                     fvg_type = fvg['type']
@@ -807,6 +816,7 @@ async def main():
                     if latest_choch_idx != -1 and fvg_idx < latest_choch_idx:
                         continue
 
+                    considered_fvgs += 1
                     confirmation_window = df1m.iloc[-12:-2]
                     if fvg_type == 'bullish':
                         confirmed = (confirmation_window['close'] > midpoint).mean() >= 0.7
@@ -815,6 +825,7 @@ async def main():
                     if not confirmed:
                         continue
 
+                    confirmed_fvgs += 1
                     score = 90.0
                     if best_setup is None or score > best_setup.get('score', 0):
                         best_setup = {
@@ -827,7 +838,21 @@ async def main():
                             'choch_level': choch_1m[-1][2] if choch_1m else current_price
                         }
 
+                diagnostics.append(
+                    f"{symbol}:choch={len(choch_1m)} fvg={len(fvg_1m)} considered={considered_fvgs} confirmed={confirmed_fvgs}"
+                )
                 await manage_open_trade(symbol, df1m)
+
+            now_minute = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if now_minute != last_diag_minute:
+                last_diag_minute = now_minute
+                diag_line = " | ".join(diagnostics) if diagnostics else "no symbols processed"
+                best_line = (
+                    f"best={best_setup['symbol']}:{best_setup['direction']} score={best_setup['score']:.1f}"
+                    if best_setup else "best=None"
+                )
+                latest_diagnostics = f"{now_minute} | {best_line} | {diag_line}"
+                log(f"📊 1m diagnostics | {best_line} | {diag_line}", to_file=True, to_recent=False)
 
             if best_setup and daily_trades < MAX_TRADES_PER_DAY and best_setup['symbol'] not in active_trades:
                 s = best_setup
