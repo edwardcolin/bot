@@ -1,7 +1,7 @@
 {
   "risk_percent": 0.6,
   "leverage": 5,
-  "symbols": ["PI_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_DOGEUSD", "PF_XRPUSD", "PF_AVAXUSD"],
+  "symbols": ["ESM6 18JUN26", "MNQM6 18JUN26", "BTCK6 29MAY26"],
   "timeframe": "1m",
   "warmup_minutes": 0,
   "max_trades_per_day": 10,
