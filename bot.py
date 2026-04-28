@@ -36,23 +36,6 @@ exchange = ccxt.krakenfutures({
 })
 exchange.set_sandbox_mode(USE_TESTNET)
 
-# ====================== ROBUST MARKET LOAD ======================
-def load_markets_robust():
-    for attempt in range(3):
-        try:
-            log(f"📡 Loading markets (attempt {attempt+1}/3)...", to_file=False)
-            markets = exchange.load_markets()
-            log(f"✅ Loaded {len(markets)} markets successfully", to_file=False)
-            return markets
-        except Exception as e:
-            log(f"⚠️ Market load failed (attempt {attempt+1}): {e}", to_file=False)
-            if attempt < 2:
-                time.sleep(5)
-    log("⚠️ Could not load markets from Kraken. Continuing with safe defaults...", to_file=False)
-    return {}
-
-load_markets_robust()
-
 # ====================== LOGGING SETUP ======================
 log_file = f"trading_log_{date.today()}.txt"
 recent_logs = deque(maxlen=2000)
@@ -78,6 +61,23 @@ def log(message, to_file=True, to_recent=True):
                 os.fsync(f.fileno())
         except Exception as e:
             print(f"[LOG ERROR] {e}")
+
+# ====================== ROBUST MARKET LOAD (now after log is defined) ======================
+def load_markets_robust():
+    for attempt in range(3):
+        try:
+            log(f"📡 Loading markets (attempt {attempt+1}/3)...", to_file=False)
+            markets = exchange.load_markets()
+            log(f"✅ Loaded {len(markets)} markets successfully", to_file=False)
+            return markets
+        except Exception as e:
+            log(f"⚠️ Market load failed (attempt {attempt+1}): {e}", to_file=False)
+            if attempt < 2:
+                time.sleep(5)
+    log("⚠️ Could not load markets from Kraken. Continuing with safe defaults...", to_file=False)
+    return {}
+
+load_markets_robust()
 
 # ====================== FLASK LIVE VIEWER ======================
 app = Flask(__name__)
@@ -200,12 +200,12 @@ def detect_choch(df):
         recent_lows = recent_df['swing_low'].iloc[i-20:i].dropna()
         if len(recent_highs) < 3 or len(recent_lows) < 3:
             continue
-        # Bullish CHOCH - series of lower highs until decisive new spike
+        # Bullish CHOCH
         if (recent_df['close'].iloc[i] > recent_highs.iloc[-1] and 
             recent_df['close'].iloc[i-1] <= recent_highs.iloc[-1] and
             recent_highs.iloc[-1] > recent_highs.iloc[-2]):
             signals.append(('bullish', len(df)-90+i, recent_highs.iloc[-1]))
-        # Bearish CHOCH - series of higher lows until decisive new spike
+        # Bearish CHOCH
         if (recent_df['close'].iloc[i] < recent_lows.iloc[-1] and 
             recent_df['close'].iloc[i-1] >= recent_lows.iloc[-1] and
             recent_lows.iloc[-1] < recent_lows.iloc[-2]):
@@ -304,7 +304,6 @@ async def manage_open_trade(symbol, df):
             except Exception as e:
                 log(f"⚠️ Breakeven failed: {e}", to_file=True)
 
-    # Simulated close fallback
     hit = False
     pnl = 0.0
     result = ""
@@ -341,7 +340,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + unpack error fixed", to_file=True)
+    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + ALL errors fixed", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
