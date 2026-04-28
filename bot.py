@@ -114,14 +114,8 @@ def show_log():
             <pre id="logpre">{display_content}</pre>
 
             <script>
-                function clearLogs() {{
-                    fetch('/clear_logs')
-                        .then(() => location.reload());
-                }}
-                function resetDailyStats() {{
-                    fetch('/reset_daily_stats')
-                        .then(() => location.reload());
-                }}
+                function clearLogs() {{ fetch('/clear_logs').then(() => location.reload()); }}
+                function resetDailyStats() {{ fetch('/reset_daily_stats').then(() => location.reload()); }}
             </script>
         </body>
         </html>
@@ -287,7 +281,6 @@ async def manage_open_trade(symbol, df):
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
 
-    # Breakeven move + update local dict
     if not trade.get('breakeven_moved', False) and trade.get('choch_level'):
         choch_level = trade['choch_level']
         if (trade['side'] == 'buy' and current_price > choch_level) or \
@@ -308,7 +301,7 @@ async def manage_open_trade(symbol, df):
             except Exception as e:
                 log(f"⚠️ Breakeven update failed for {symbol}: {e}", to_file=True)
 
-    # Simulated price-based close (kept as fallback)
+    # Simulated close (fallback only)
     hit = False
     pnl = 0.0
     result = ""
@@ -335,65 +328,79 @@ async def manage_open_trade(symbol, df):
         global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
         daily_pnl += pnl
         total_pnl += pnl
-
         if result == "WIN":
             total_wins += 1
             total_win_usd += abs(pnl)
         else:
             total_losses += 1
             total_loss_usd += abs(pnl)
-
         duration = (datetime.now() - trade['open_time']).seconds // 60
         log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (simulated) | PNL: ${pnl:.5f} | Duration: {duration} min", to_file=True)
         del active_trades[symbol]
 
 async def sync_active_trades():
-    """Reliably detects SL/TP closures by checking Kraken positions + fetching REAL realized PnL."""
+    """Robust position sync with fallback for Kraken Futures flakiness"""
     global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
+    if not active_trades:
+        return
+
     try:
+        # Primary method
         positions = exchange.fetch_positions()
         open_symbols = {p['symbol'] for p in positions if float(p.get('contracts', 0)) != 0}
+    except Exception as e1:
+        log(f"⚠️ fetch_positions failed (common on testnet). Trying raw API...", to_file=False)
+        try:
+            # Fallback: direct Kraken Futures endpoint
+            raw = exchange.private_get_openpositions()
+            open_symbols = set()
+            if isinstance(raw, dict) and 'openPositions' in raw:
+                for pos in raw['openPositions']:
+                    if float(pos.get('size', 0)) != 0:
+                        open_symbols.add(pos.get('symbol'))
+            elif isinstance(raw, list):
+                for pos in raw:
+                    if float(pos.get('size', 0)) != 0:
+                        open_symbols.add(pos.get('symbol'))
+            else:
+                open_symbols = set()
+        except Exception as e2:
+            log(f"⚠️ All position checks failed: {e2}", to_file=False)
+            return
 
-        for symbol in list(active_trades.keys()):
-            if symbol not in open_symbols:
-                trade = active_trades[symbol]
-                
-                # Fetch real closing trades for accurate PnL
-                since = int(trade['open_time'].timestamp() * 1000) - 60000  # 1 min buffer
-                my_trades = exchange.fetch_my_trades(symbol, since=since, limit=50)
-                
-                realized_pnl = 0.0
-                closing_found = False
+    # Process any closed positions
+    for symbol in list(active_trades.keys()):
+        if symbol not in open_symbols:
+            trade = active_trades[symbol]
+            realized_pnl = 0.0
+            try:
+                # Try to get real PnL from recent trades
+                since = int(trade['open_time'].timestamp() * 1000) - 60000
+                my_trades = exchange.fetch_my_trades(symbol, since=since, limit=20)
                 for t in my_trades:
-                    if t.get('side') != trade['side'] and t.get('amount') == trade.get('quantity', 0):  # opposite side = close
+                    if t.get('side') != trade['side'] and abs(float(t.get('amount', 0))) == trade.get('quantity', 0):
                         realized_pnl += float(t.get('info', {}).get('realizedPnl', 0) or t.get('realizedPnl', 0) or 0)
-                        closing_found = True
-                
-                # Fallback if no exact match
-                if not closing_found:
-                    realized_pnl = RISK_USD * (-1 if not trade.get('breakeven_moved', False) else -0.3)
-                
-                result = "WIN" if realized_pnl > 0 else "LOSS"
-                
-                daily_pnl += realized_pnl
-                total_pnl += realized_pnl
-                
-                if result == "WIN":
-                    total_wins += 1
-                    total_win_usd += abs(realized_pnl)
-                else:
-                    total_losses += 1
-                    total_loss_usd += abs(realized_pnl)
+            except Exception:
+                # Fallback approximation if trade fetch also fails
+                realized_pnl = RISK_USD * (-1 if not trade.get('breakeven_moved', False) else -0.3)
 
-                duration = (datetime.now() - trade['open_time']).seconds // 60
-                log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (exchange SL/TP) | REAL PNL: ${realized_pnl:.5f} | Duration: {duration} min", to_file=True)
-                del active_trades[symbol]
-    except Exception as e:
-        log(f"⚠️ Position sync failed: {e}", to_file=False)
+            result = "WIN" if realized_pnl > 0 else "LOSS"
+            daily_pnl += realized_pnl
+            total_pnl += realized_pnl
+            if result == "WIN":
+                total_wins += 1
+                total_win_usd += abs(realized_pnl)
+            else:
+                total_losses += 1
+                total_loss_usd += abs(realized_pnl)
+
+            duration = (datetime.now() - trade['open_time']).seconds // 60
+            log(f"   ✅ [{symbol}] {trade['side'].upper()} {result} CLOSED (exchange SL/TP) | REAL PNL: ${realized_pnl:.5f} | Duration: {duration} min", to_file=True)
+            del active_trades[symbol]
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Real Money Ready - Accurate SL/TP Sync + 5-decimal PnL + Clear Buttons\n", to_file=True)
+    log("🚀 Real Money Ready - ROBUST SL/TP Sync (with fallback) + 5-decimal PnL\n", to_file=True)
 
     try:
         positions = exchange.fetch_positions()
@@ -404,16 +411,15 @@ async def main():
                 log(f"🔄 Found existing {side.upper()} position on {symbol}", to_file=True)
                 active_trades[symbol] = {'side': side, 'entry_price': float(pos.get('entryPrice', 0)), 'stop_price': 0, 'tp_price': 0, 'quantity': abs(float(pos['contracts'])), 'open_time': datetime.now(), 'choch_level': 0, 'breakeven_moved': False}
     except Exception as e:
-        log(f"Warning: Could not load positions: {e}", to_file=True)
+        log(f"Warning: Could not load initial positions: {e}", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
     cooldown_minutes = 1440 / MAX_TRADES_PER_DAY
-    wiggle_minutes = cooldown_minutes * 0.50
+    wiggle_minutes = cooldown_minutes * 0.25
 
     while True:
         try:
-            # Dynamic risk calculation
             account_balance = get_account_balance()
             RISK_USD = account_balance * (RISK_PERCENT / 100.0)
 
@@ -467,7 +473,6 @@ async def main():
                 log(f"[{symbol}] Price: {current_price:.4f} | 15m Bias: {latest_15m_bias or 'NONE'} | 1m CHOCH: {len(choch_1m)} | 1m FVGs: {len(fvg_1m)}", to_file=False)
 
                 await manage_open_trade(symbol, df1m)
-                await sync_active_trades()          # ← NEW: accurate closure detection
                 if symbol in active_trades:
                     continue
 
@@ -496,6 +501,10 @@ async def main():
                         best_setup = (symbol, fvg_type, current_price, fvg_extreme, ATR_MULTIPLIER * calculate_atr(df1m))
                         best_choch_level = latest_choch_level
 
+            # ←←← ROBUST SYNC CALLED ONLY ONCE PER CYCLE ←←←
+            await sync_active_trades()
+
+            # ... rest of trading logic (unchanged)
             is_elite = False
             if daily_setups and best_score > 0:
                 all_scores = [s['score'] for s in daily_setups]
@@ -548,7 +557,7 @@ if __name__ == "__main__":
     current_day = date.today()
     last_trade_time = None
 
-    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | Accurate SL/TP Sync + 5-decimal PnL + Clear Buttons")
+    log(f"Bot started | Risk: {RISK_PERCENT}% of balance | ROBUST SL/TP Sync (fallback enabled)")
     log(f"Symbols: {SYMBOLS} | Real Money Ready\n", to_file=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
