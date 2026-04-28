@@ -28,6 +28,11 @@ MAX_TRADES_PER_DAY = config.get("max_trades_per_day", 9)
 MAX_DAILY_LOSS_USD = config.get("max_daily_loss_usd", 5.0)
 RR_RATIO = config.get("rr_ratio", 3.7)
 USE_TESTNET = config.get("use_testnet", True)
+DRY_RUN_MODE = config.get("dry_run_mode", False)
+try:
+    DRY_RUN_STARTING_WALLET_USD = float(config.get("dry_run_starting_wallet_usd", 100.0))
+except (TypeError, ValueError):
+    DRY_RUN_STARTING_WALLET_USD = 100.0
 PRECHECK_DISABLE_AFTER = int(config.get("precheck_disable_after", 3))
 
 exchange = ccxt.krakenfutures({
@@ -37,6 +42,8 @@ exchange = ccxt.krakenfutures({
     'timeout': 15000,
 })
 exchange.set_sandbox_mode(USE_TESTNET)
+MODE_LABEL = "TESTNET" if USE_TESTNET else "LIVE"
+EXECUTION_LABEL = "DRY-RUN" if DRY_RUN_MODE else "REAL-ORDERS"
 
 # ====================== LOGGING SETUP ======================
 log_file = f"trading_log_{date.today()}.txt"
@@ -109,6 +116,13 @@ def show_log():
         pnl_color = "#4ade80" if total_pnl >= 0 else "#f87171"
         pnl_sign = "+" if total_pnl >= 0 else ""
         risk_usd_preview = _safe_float(balance_snapshot.get("available_usd"), 0.0) * (RISK_PERCENT / 100.0)
+        simulated_active_count = sum(1 for t in active_trades.values() if t.get("simulated"))
+        simulation_notice_html = (
+            f"<div style='margin-bottom:12px;padding:10px 14px;background:#3b2f07;border:1px solid #d4a017;border-radius:6px;color:#f7d774;'>"
+            f"🧪 SIMULATION MODE ACTIVE (NO REAL ORDERS) | Active simulated trades: {simulated_active_count}"
+            f"</div>"
+            if DRY_RUN_MODE else ""
+        )
         active_summary = ""
         for sym, trade in active_trades.items():
             active_summary += f"<div class='trade-item'>[{sym}] {trade['side'].upper()} @ {trade['entry_price']:.4f} | SL: {trade['stop_price']:.4f} | TP: {trade['tp_price']:.4f}</div>"
@@ -116,7 +130,7 @@ def show_log():
         html = f"""
         <html>
         <head>
-            <title>Kraken ICT Bot - LIVE</title>
+            <title>Kraken ICT Bot - {MODE_LABEL}</title>
             <style>
                 body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; line-height: 1.4; margin: 0; }}
                 .stats-header {{ background: #252526; border: 2px solid #3c3c3c; border-radius: 8px; padding: 15px 20px; margin-bottom: 20px; font-size: 18px; display: flex; flex-wrap: wrap; gap: 25px; align-items: center; }}
@@ -132,7 +146,8 @@ def show_log():
             </style>
         </head>
         <body>
-            <h2 class="header">🚀 Kraken ICT Bot - LIVE (1m CHOCH 90min Pattern + FVG)</h2>
+            <h2 class="header">🚀 Kraken ICT Bot - {MODE_LABEL} | {EXECUTION_LABEL} (1m CHOCH 90min Pattern + FVG)</h2>
+            {simulation_notice_html}
             <div class="buttons">
                 <button onclick="clearLogs()">🗑️ Clear Logs</button>
                 <button onclick="resetDailyStats()">🔄 Reset Daily Stats</button>
@@ -208,6 +223,7 @@ live_balance = {
     "used_usd": 0.0,
     "fetched_at": None,
 }
+simulated_wallet_usd = max(DRY_RUN_STARTING_WALLET_USD, 0.0)
 symbol_precheck_failures = {}
 disabled_symbols = {}
 latest_diagnostics = "No diagnostics yet."
@@ -299,6 +315,14 @@ def _compute_realized_pnl(symbol, trade, exit_price):
     realized = gross - fee_total
     return realized, fee_total
 
+def _compute_simulated_pnl(trade, exit_price):
+    entry_price = _safe_float(trade.get('entry_fill_price'), 0.0) or _safe_float(trade.get('entry_price'), 0.0)
+    qty = _safe_float(trade.get('quantity'), 0.0)
+    side = trade.get('side')
+    if qty <= 0 or entry_price <= 0 or exit_price <= 0:
+        return 0.0
+    return (exit_price - entry_price) * qty if side == 'buy' else (entry_price - exit_price) * qty
+
 def _floor_to_step(value, step):
     if step <= 0:
         return max(value, 0.0)
@@ -386,6 +410,22 @@ def precheck_symbol_tradeability(symbol, current_price, stop_price, risk_usd):
     }
 
 def refresh_live_balance():
+    global simulated_wallet_usd
+    if DRY_RUN_MODE:
+        simulated_used_usd = 0.0
+        for trade in active_trades.values():
+            if trade.get("simulated"):
+                simulated_used_usd += max(_safe_float(trade.get("required_margin_estimate_usd"), 0.0), 0.0)
+        simulated_used_usd = min(simulated_used_usd, simulated_wallet_usd)
+        simulated_available_usd = max(simulated_wallet_usd - simulated_used_usd, 0.0)
+        live_balance.update({
+            "wallet_usd": max(simulated_wallet_usd, 0.0),
+            "equity_usd": max(simulated_wallet_usd, 0.0),
+            "available_usd": simulated_available_usd,
+            "used_usd": simulated_used_usd,
+            "fetched_at": datetime.now().strftime("%H:%M:%S"),
+        })
+        return live_balance.copy()
     try:
         balance = exchange.fetch_balance()
         usd_bucket = balance.get('USD', {}) or {}
@@ -547,13 +587,65 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
             to_file=True
         )
 
+        limit_price = current_price * (1.002 if side == 'buy' else 0.998)
+        opposite = 'sell' if side == 'buy' else 'buy'
+
+        if DRY_RUN_MODE:
+            trade_id = str(uuid4())
+            dry_run_payload = {
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "side": side,
+                "entry_type": "limit",
+                "entry_price": float(limit_price),
+                "entry_reference_price": float(current_price),
+                "quantity": float(quantity),
+                "leverage": int(LEVERAGE),
+                "stop_price": float(stop_price),
+                "stop_side": opposite,
+                "take_profit_price": float(tp_price),
+                "take_profit_side": opposite,
+                "risk_usd_target": float(risk_usd),
+                "estimated_stop_loss_usd": float(est_risk),
+                "required_margin_estimate_usd": float(required_margin),
+                "available_usd_at_signal": float(available_usd),
+                "score": float(score),
+                "choch_level": float(choch_level),
+                "fvg_extreme": float(fvg_extreme),
+            }
+            log(
+                f"🧪 DRY RUN | WOULD CREATE ORDER [{symbol}] {side.upper()} "
+                f"| qty={quantity} | limit={limit_price:.4f} | SL={stop_price:.4f} | TP={tp_price:.4f} | lev={LEVERAGE}x",
+                to_file=True
+            )
+
+            active_trades[symbol] = {
+                'trade_id': trade_id,
+                'side': side,
+                'entry_price': float(current_price),
+                'stop_price': float(stop_price),
+                'tp_price': float(tp_price),
+                'quantity': float(quantity),
+                'open_time': datetime.now(),
+                'choch_level': float(choch_level),
+                'fvg_extreme': float(fvg_extreme),
+                'breakeven_moved': False,
+                'entry_order_id': f"dryrun-entry-{uuid4()}",
+                'sl_order_id': f"dryrun-sl-{uuid4()}",
+                'tp_order_id': f"dryrun-tp-{uuid4()}",
+                'entry_fill_price': float(current_price),
+                'entry_filled': float(quantity),
+                'simulated': True,
+                'required_margin_estimate_usd': float(required_margin),
+            }
+            log_trade_audit("dry_run_trade_signal", dry_run_payload)
+            return {"id": f"dryrun-{uuid4()}", "dry_run": True, "info": dry_run_payload}
+
         # Conservative adjustment to avoid insufficientAvailableFunds
         try:
             exchange.set_leverage(LEVERAGE, symbol)
         except Exception as e:
             log(f"⚠️ [{symbol}] set_leverage failed ({LEVERAGE}x): {e}", to_file=True)
-
-        limit_price = current_price * (1.002 if side == 'buy' else 0.998)
 
         order = exchange.create_order(symbol=symbol, type='limit', side=side, amount=quantity, price=limit_price, params={'leverage': LEVERAGE})
         log(f"✅ ENTRY ORDER CREATED | ID: {order.get('id')}", to_file=True)
@@ -583,7 +675,6 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
 
         log("✅ REAL POSITION CONFIRMED", to_file=True)
 
-        opposite = 'sell' if side == 'buy' else 'buy'
         sl_order = exchange.create_order(
             symbol=symbol,
             type='market',
@@ -652,30 +743,49 @@ async def place_trade(symbol, side, current_price, stop_price, tp_price, risk_us
 # (manage_open_trade, main loop, etc. are the same as the previous working version)
 
 async def manage_open_trade(symbol, df):
+    global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, simulated_wallet_usd
     if symbol not in active_trades:
         return
     trade = active_trades[symbol]
     current_price = df['close'].iloc[-1]
     fvg_extreme = trade['fvg_extreme']
+    latest_high = _safe_float(df['high'].iloc[-1], 0.0)
+    latest_low = _safe_float(df['low'].iloc[-1], 0.0)
+    both_touched = (
+        latest_low <= trade['stop_price'] and latest_high >= trade['tp_price']
+        if trade['side'] == 'buy'
+        else latest_high >= trade['stop_price'] and latest_low <= trade['tp_price']
+    )
+
+    if both_touched:
+        mode_tag = "SIM" if trade.get('simulated') else "LIVE"
+        log(
+            f"⚖️ [{symbol}] {mode_tag} candle touched both SL and TP; no action this cycle.",
+            to_file=True
+        )
+        return
 
     if not trade.get('breakeven_moved', False):
         if (trade['side'] == 'buy' and current_price > fvg_extreme) or \
            (trade['side'] == 'sell' and current_price < fvg_extreme):
             try:
                 new_sl = trade['entry_price']
-                side_for_sl = 'sell' if trade['side'] == 'buy' else 'buy'
-                if trade.get('sl_order_id'):
-                    exchange.cancel_order(trade.get('sl_order_id'), symbol)
-                be_sl_order = exchange.create_order(
-                    symbol=symbol,
-                    type='market',
-                    side=side_for_sl,
-                    amount=trade['quantity'],
-                    params={'stopLossPrice': new_sl, 'reduceOnly': True, 'triggerSignal': 'mark'}
-                )
                 trade['stop_price'] = new_sl
                 trade['breakeven_moved'] = True
-                trade['sl_order_id'] = (be_sl_order or {}).get('id')
+                if trade.get('simulated'):
+                    trade['sl_order_id'] = f"dryrun-sl-be-{uuid4()}"
+                else:
+                    side_for_sl = 'sell' if trade['side'] == 'buy' else 'buy'
+                    if trade.get('sl_order_id'):
+                        exchange.cancel_order(trade.get('sl_order_id'), symbol)
+                    be_sl_order = exchange.create_order(
+                        symbol=symbol,
+                        type='market',
+                        side=side_for_sl,
+                        amount=trade['quantity'],
+                        params={'stopLossPrice': new_sl, 'reduceOnly': True, 'triggerSignal': 'mark'}
+                    )
+                    trade['sl_order_id'] = (be_sl_order or {}).get('id')
                 log_trade_audit("breakeven_moved", {
                     "trade_id": trade.get('trade_id'),
                     "symbol": symbol,
@@ -687,18 +797,80 @@ async def manage_open_trade(symbol, df):
             except Exception as e:
                 log(f"⚠️ Breakeven failed: {e}", to_file=True)
 
-    try:
-        positions = exchange.fetch_positions([symbol])
-        has_position = any(
-            p.get('symbol') == symbol and abs(float(p.get('contracts', 0) or 0)) > 0
-            for p in positions
-        )
-    except Exception as e:
-        log(f"⚠️ Could not fetch positions for reconciliation ({symbol}): {e}", to_file=True)
-        return
+    if trade.get('simulated'):
+        has_position = True
+        close_reason = None
+        exit_price = None
+
+        if trade['side'] == 'buy':
+            if latest_low <= trade['stop_price']:
+                close_reason = "SL_HIT_SIMULATED"
+                exit_price = _safe_float(trade['stop_price'], 0.0)
+            elif latest_high >= trade['tp_price']:
+                close_reason = "TP_HIT_SIMULATED"
+                exit_price = _safe_float(trade['tp_price'], 0.0)
+        else:
+            if latest_high >= trade['stop_price']:
+                close_reason = "SL_HIT_SIMULATED"
+                exit_price = _safe_float(trade['stop_price'], 0.0)
+            elif latest_low <= trade['tp_price']:
+                close_reason = "TP_HIT_SIMULATED"
+                exit_price = _safe_float(trade['tp_price'], 0.0)
+
+        if close_reason and exit_price and exit_price > 0:
+            pnl = _compute_simulated_pnl(trade, exit_price)
+            fee_total = 0.0
+            simulated_wallet_usd = max(simulated_wallet_usd + pnl - fee_total, 0.0)
+            refresh_live_balance()
+            daily_pnl += pnl
+            total_pnl += pnl
+            if pnl >= 0:
+                total_wins += 1
+                total_win_usd += abs(pnl)
+                result = "WIN"
+            else:
+                total_losses += 1
+                total_loss_usd += abs(pnl)
+                result = "LOSS"
+            log_trade_audit("trade_closed", {
+                "trade_id": trade.get('trade_id'),
+                "symbol": symbol,
+                "side": trade.get('side'),
+                "result": result,
+                "close_reason": close_reason,
+                "entry_price": _safe_float(trade.get('entry_fill_price') or trade.get('entry_price')),
+                "exit_price": float(exit_price),
+                "quantity": _safe_float(trade.get('quantity')),
+                "fees_usd": float(fee_total),
+                "realized_pnl_usd": float(pnl),
+                "order_ids": {
+                    "entry_order_id": trade.get('entry_order_id'),
+                    "sl_order_id": trade.get('sl_order_id'),
+                    "tp_order_id": trade.get('tp_order_id'),
+                },
+                "duration_seconds": max((datetime.now() - trade.get('open_time', datetime.now())).total_seconds(), 0.0),
+                "simulated": True,
+            })
+            del active_trades[symbol]
+            log(
+                f"   🧪 [{symbol}] {trade['side'].upper()} {result} CLOSED ({close_reason}) | Exit @{exit_price:.4f} | PnL ${pnl:.4f}",
+                to_file=True
+            )
+            has_position = False
+    else:
+        try:
+            positions = exchange.fetch_positions([symbol])
+            has_position = any(
+                p.get('symbol') == symbol and abs(float(p.get('contracts', 0) or 0)) > 0
+                for p in positions
+            )
+        except Exception as e:
+            log(f"⚠️ Could not fetch positions for reconciliation ({symbol}): {e}", to_file=True)
+            return
 
     if not has_position:
-        global daily_pnl, daily_trades, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd
+        if trade.get('simulated'):
+            return
         close_reason, exit_price = _determine_close_reason_and_price(symbol, trade)
         pnl, fee_total = _compute_realized_pnl(symbol, trade, exit_price)
         daily_pnl += pnl
@@ -738,6 +910,9 @@ async def manage_open_trade(symbol, df):
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, audit_file, last_trade_time, RISK_USD, latest_diagnostics
     log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + improved tracking", to_file=True)
+    log(f"🔐 Mode: {MODE_LABEL} | Execution: {EXECUTION_LABEL}", to_file=True)
+    if DRY_RUN_MODE:
+        log(f"🧪 Dry-run simulated wallet start: ${simulated_wallet_usd:.5f}", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
