@@ -1,7 +1,7 @@
 {
   "risk_percent": 0.6,
   "leverage": 1,
-  "symbols": ["BTC/USD", "ETH/USD", "SOL/USD"],
+  "symbols": ["DOGE/USD", "XRP/USD", "SOL/USD"],
   "timeframe": "1m",
   "warmup_minutes": 0,
   "max_trades_per_day": 10,
