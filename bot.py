@@ -36,19 +36,19 @@ exchange = ccxt.krakenfutures({
 })
 exchange.set_sandbox_mode(USE_TESTNET)
 
-# ====================== ROBUST MARKET LOAD (fixes timeout) ======================
+# ====================== ROBUST MARKET LOAD ======================
 def load_markets_robust():
     for attempt in range(3):
         try:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 📡 Loading markets (attempt {attempt+1}/3)...")
+            log(f"📡 Loading markets (attempt {attempt+1}/3)...", to_file=False)
             markets = exchange.load_markets()
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Loaded {len(markets)} markets successfully")
+            log(f"✅ Loaded {len(markets)} markets successfully", to_file=False)
             return markets
         except Exception as e:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Market load failed (attempt {attempt+1}): {e}")
+            log(f"⚠️ Market load failed (attempt {attempt+1}): {e}", to_file=False)
             if attempt < 2:
                 time.sleep(5)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Could not load markets. Continuing with safe defaults...")
+    log("⚠️ Could not load markets from Kraken. Continuing with safe defaults...", to_file=False)
     return {}
 
 load_markets_robust()
@@ -189,7 +189,7 @@ def detect_swing_highs_lows(df, strength=5):
     return df
 
 def detect_choch(df):
-    """1m-only CHOCH with 90-minute pattern recognition (exactly as requested)"""
+    """1m-only CHOCH with 90-minute pattern recognition (exactly as you described)"""
     if len(df) < 100:
         return []
     recent_df = df.iloc[-90:].copy()
@@ -200,12 +200,12 @@ def detect_choch(df):
         recent_lows = recent_df['swing_low'].iloc[i-20:i].dropna()
         if len(recent_highs) < 3 or len(recent_lows) < 3:
             continue
-        # Bullish CHOCH
+        # Bullish CHOCH - series of lower highs until decisive new spike
         if (recent_df['close'].iloc[i] > recent_highs.iloc[-1] and 
             recent_df['close'].iloc[i-1] <= recent_highs.iloc[-1] and
             recent_highs.iloc[-1] > recent_highs.iloc[-2]):
             signals.append(('bullish', len(df)-90+i, recent_highs.iloc[-1]))
-        # Bearish CHOCH
+        # Bearish CHOCH - series of higher lows until decisive new spike
         if (recent_df['close'].iloc[i] < recent_lows.iloc[-1] and 
             recent_df['close'].iloc[i-1] >= recent_lows.iloc[-1] and
             recent_lows.iloc[-1] < recent_lows.iloc[-2]):
@@ -219,11 +219,11 @@ def detect_fvg(df):
         # Bullish FVG
         if (c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open'] and c1['high'] < c3['low']):
             midpoint = (c1['high'] + c3['low']) / 2
-            fvgs.append(('bullish', midpoint, c3['low'], i, c1['high'], c3['low'], i-1))
+            fvgs.append({'type': 'bullish', 'midpoint': midpoint, 'extreme': c3['low'], 'idx': i, 'candle_idx': i-1})
         # Bearish FVG
         if (c1['close'] < c1['open'] and c2['close'] < c2['open'] and c3['close'] < c3['open'] and c1['low'] > c3['high']):
             midpoint = (c1['low'] + c3['high']) / 2
-            fvgs.append(('bearish', midpoint, c3['high'], i, c1['low'], c3['high'], i-1))
+            fvgs.append({'type': 'bearish', 'midpoint': midpoint, 'extreme': c3['high'], 'idx': i, 'candle_idx': i-1})
     return fvgs
 
 async def fetch_latest_candles(symbol, tf, limit=500):
@@ -304,6 +304,7 @@ async def manage_open_trade(symbol, df):
             except Exception as e:
                 log(f"⚠️ Breakeven failed: {e}", to_file=True)
 
+    # Simulated close fallback
     hit = False
     pnl = 0.0
     result = ""
@@ -340,7 +341,7 @@ async def manage_open_trade(symbol, df):
 
 async def main():
     global daily_trades, daily_pnl, total_wins, total_losses, total_pnl, total_win_usd, total_loss_usd, current_day, log_file, last_trade_time, RISK_USD
-    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + timeout fix", to_file=True)
+    log("🚀 Kraken ICT Bot Started - 1m CHOCH (90min pattern) + FVG + unpack error fixed", to_file=True)
 
     warmup_end = datetime.now() + timedelta(minutes=WARMUP_MINUTES)
     in_warmup = WARMUP_MINUTES > 0
@@ -387,11 +388,11 @@ async def main():
                 latest_choch_idx = choch_1m[-1][1] if choch_1m else -1
 
                 for fvg in fvg_1m[-20:]:
-                    fvg_type = fvg[0]
-                    midpoint = fvg[1]
-                    fvg_extreme = fvg[2]
-                    fvg_idx = fvg[3]
-                    fvg_candle_idx = fvg[6]
+                    fvg_type = fvg['type']
+                    midpoint = fvg['midpoint']
+                    fvg_extreme = fvg['extreme']
+                    fvg_idx = fvg['idx']
+                    fvg_candle_idx = fvg['candle_idx']
 
                     if latest_choch_idx != -1 and fvg_idx < latest_choch_idx:
                         continue
